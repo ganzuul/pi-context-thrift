@@ -45,6 +45,7 @@ import {
   EVIDENCE_SYSTEM_PROMPT,
   entryToJsonLine,
   estimateContextChars,
+  estimateContextSize,
   formatStatus,
   formatTokens,
   parseCommitArgs,
@@ -60,6 +61,7 @@ import {
   type DecisionKind,
   type GoldenConfig,
   type GoldenEntry,
+  type KvAnchor,
 } from "./golden-core.ts";
 
 const GOLDEN_SECTION_NAME = "golden"; // systemPromptOptions.sections key
@@ -97,6 +99,10 @@ interface LiveState {
   /** footer counter line for the last checkpoint (est, then measured) */
   lastCkptStatus?: string | undefined;
   lastCkptMeasured?: boolean;
+  /** KV-anchored size: measured prompt tokens of the last response + its context —
+   *  the authoritative "how full is the window" input for ALL compaction triggers
+   *  (findings §14: sizing from raw chat history re-fires compaction falsely) */
+  kvAnchor?: KvAnchor | undefined;
 }
 
 function resolveStorePath(cfg: GoldenConfig): string {
@@ -260,9 +266,13 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     // about to go out crosses contextFullPct of the window, fold the covered history into
     // a checkpoint RIGHT HERE (mid-run), then purge below. The evidence call is bounded
     // (timeoutMs), so this can never wedge the request the way pi's summarizer can.
+    // Size from the KV-anchored estimate (measured last prompt + growth since) — NOT the
+    // raw chat window: the store keeps full message bodies that the purge keeps off the
+    // wire, so a history-based size would read "full" while the KV cache is mostly empty
+    // and force checkpoints in a loop (findings §14).
     if (state.cfg.autoCheckpoint && ctx.model?.contextWindow && ctx.model.contextWindow > 0) {
       const projected = toLlmMessages(event.messages as never[]);
-      const estTok = Math.round(estimateContextChars(state.runSystemPrompt ?? "", projected) / 4);
+      const estTok = estimateContextSize(state.runSystemPrompt ?? "", projected, state.kvAnchor);
       if (estTok >= (ctx.model.contextWindow * state.cfg.contextFullPct) / 100) {
         await commitCheckpoint(ctx, projected, { prefill: false, requireCompletedTurn: false, force: true });
       }
@@ -471,6 +481,25 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     }
     const branchEntries = (event as { branchEntries?: SessionEntry[] }).branchEntries ?? ctx.sessionManager.getBranch();
     const messages = toLlmMessages(buildSessionContext(branchEntries as never).messages as unknown as AnyMessage[]);
+
+    // pi's "threshold" reason is produced by its history-based sizing: stale
+    // pre-compaction usage on kept entries, or chars/4 over the raw chat window when
+    // usage is missing/errored (findings §14 — reproduced: 86k "tokens" while the real
+    // KV prompt was ~6k). Before force-folding anything, re-check against the
+    // KV-anchored size; if the window isn't actually near full, cancel instead of
+    // compounding pi's false positive with checkpoint spam. "manual" (/compact) and
+    // "overflow" (the engine itself refused) always proceed — real intent, real need.
+    if ((event as { reason?: string }).reason === "threshold") {
+      const window = ctx.model?.contextWindow ?? 0;
+      const anchored = estimateContextSize(state.runSystemPrompt ?? "", messages, state.kvAnchor);
+      if (window > 0 && anchored * 100 < window * state.cfg.contextFullPct) {
+        if (process.env.PI_GOLDEN_DEBUG) {
+          try { ctx.ui.notify(`golden: cancelled pi threshold compaction — KV-anchored ${anchored} tok < ${state.cfg.contextFullPct}% of ${window}`, "info"); } catch { /* UI absent */ }
+        }
+        return { cancel: true };
+      }
+    }
+
     const entry = await commitCheckpoint(ctx, messages, { prefill: false, requireCompletedTurn: false, force: true });
     if (!entry) return { cancel: true };
 
@@ -509,10 +538,25 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   // Context counter, measured: once the next response lands, its usage is the engine's
   // real prompt count for the purged request — replace the estimate with that number.
   pi.on("message_end", (event, ctx: ExtensionContext) => {
-    if (!state.cfg.enabled || !state.lastCkptStatus || state.lastCkptMeasured) return;
-    const m = event.message as { role?: string; usage?: { input?: number; cacheRead?: number } };
-    if (m.role !== "assistant" || !m.usage) return;
-    const promptTok = (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0);
+    if (!state.cfg.enabled) return;
+    const m = event.message as {
+      role?: string; timestamp?: number;
+      usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
+    };
+    // KV anchor: prompt tokens of THIS response's request = what actually sat in the KV
+    // cache (input + cached read/write). Recorded before the counter gate — it feeds the
+    // compaction triggers on every response, checkpoint or not.
+    const promptTok = m.role === "assistant" && m.usage
+      ? (m.usage.input ?? 0) + (m.usage.cacheRead ?? 0) + (m.usage.cacheWrite ?? 0)
+      : 0;
+    if (promptTok > 0) {
+      state.kvAnchor = {
+        tokens: promptTok,
+        ts: m.timestamp ?? Date.now(),
+        systemChars: Buffer.byteLength(state.runSystemPrompt ?? "", "utf8"),
+      };
+    }
+    if (!state.lastCkptStatus || state.lastCkptMeasured) return;
     if (promptTok <= 0) return;
     state.lastCkptMeasured = true;
     state.lastCkptStatus = `${state.lastCkptStatus} · measured ${formatTokens(promptTok)} tok`;

@@ -35,6 +35,19 @@ function check(name, cond) {
   else { fail++; console.log("FAIL -", name); }
 }
 
+// ---- KV-anchored sizing (findings §14: sizing from chat history re-fires compaction) ----
+{
+  const sys = "S".repeat(400);
+  const oldBig = [{ role: "toolResult", timestamp: 1, content: [{ type: "text", text: "x".repeat(400000) }] }];
+  const anchor = { tokens: 5000, ts: 900000, systemChars: Buffer.byteLength(sys) };
+  check("no anchor -> full history estimate (cold start)", core.estimateContextSize(sys, oldBig, undefined) >= 100000);
+  check("anchor ignores already-measured history", core.estimateContextSize(sys, oldBig, anchor) === 5000);
+  const grown = [...oldBig, { role: "user", content: [{ type: "text", text: "new".repeat(400) }], timestamp: 900001 }];
+  const s2 = core.estimateContextSize(sys, grown, anchor);
+  check("anchor adds only growth since the measurement", s2 > 5000 && s2 < 5000 + 1500);
+  check("system-prompt growth counts toward the size", core.estimateContextSize(sys + "GROWTH".repeat(100), oldBig, anchor) > 5000);
+}
+
 // ---- parseConfig ----
 const d = core.parseConfig({});
 check("defaults conservative (no auto-eject)", d.autoEjectOldToolResults === false && d.tailKeepToolResults === 4);
@@ -549,6 +562,9 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
     { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "tF2", name: "bash", arguments: { command: "z" } }], timestamp: 3003 },
   ];
   const beforeInflight = (() => { try { return readFileSync(storePath, "utf8").trim().split("\n").length; } catch { return 0; } })();
+  // KV-anchored triggers: seed the anchor as "measured near-full" so the in-flight
+  // decision comes from the measured prompt (findings §14), not raw-history chars/4.
+  handlers.message_end[0]({ type: "message_end", message: { role: "assistant", timestamp: 2500, usage: { input: 900, cacheRead: 0, cacheWrite: 0 } } }, inflightCtx);
   const evResult = await handlers.context[0]({ type: "context", messages: bigMsgs }, inflightCtx);
   await new Promise((r) => setTimeout(r, 80));
   const afterInflight = readFileSync(storePath, "utf8").trim().split("\n").length;
@@ -561,6 +577,67 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   await handlers.context[0]({ type: "context", messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 4000 }] }, quietCtx);
   await new Promise((r) => setTimeout(r, 60));
   check("no in-flight trigger below contextFullPct", readFileSync(storePath, "utf8").trim().split("\n").length === beforeQuiet);
+
+  // ---- findings §14: triggers size from the KV-anchored measurement, not chat history ----
+  const storeLines = () => readFileSync(storePath, "utf8").trim().split("\n").length;
+
+  // low anchor: measured prompt = 5000 tokens at ts 900000
+  handlers.message_end[0]({ type: "message_end", message: { role: "assistant", timestamp: 900000, usage: { input: 4000, cacheRead: 1000, cacheWrite: 0 } } }, takeCtx);
+
+  const gateCtx = { ...takeCtx, model: { id: "tinyclip", provider: "mock", contextWindow: 100000 } };
+  // fresh foldable material (ts > current floor 3003, savings > 512) — without the gate,
+  // a threshold trigger here would COMMIT; with the gate it must cancel untouched.
+  const freshEntries = [
+    { id: "f1", type: "message", message: { role: "user", content: [{ type: "text", text: "again" }], timestamp: 5000 } },
+    { id: "f2", type: "message", message: { role: "assistant", content: [
+      { type: "thinking", thinking: "t".repeat(1000) },
+      { type: "toolCall", id: "tG1", name: "bash", arguments: { command: "x" } } ], timestamp: 5001 } },
+    { id: "f3", type: "message", message: { role: "toolResult", toolCallId: "tG1", toolName: "bash", isError: false, timestamp: 5002,
+      content: [{ type: "text", text: "RESULT ".repeat(200) }] } },
+    { id: "f4", type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Done again." }], timestamp: 5003 } },
+  ];
+
+  const nCallsBeforeThreshold = takeCalls.length;
+  const nStoreBeforeThreshold = storeLines();
+  const thr = await handlers.session_before_compact[0]({
+    type: "session_before_compact", reason: "threshold", branchEntries: freshEntries, preparation: { tokensBefore: 90000 },
+  }, gateCtx);
+  await new Promise((r) => setTimeout(r, 60));
+  check("pi threshold trigger is CANCELLED when KV-anchored size is low (no evidence call)",
+    thr?.cancel === true && takeCalls.length === nCallsBeforeThreshold && storeLines() === nStoreBeforeThreshold);
+
+  // manual /compact must still run even below the threshold (real user intent)
+  const man = await handlers.session_before_compact[0]({
+    type: "session_before_compact", reason: "manual", branchEntries: freshEntries, preparation: { tokensBefore: 90000 },
+  }, gateCtx);
+  check("manual /compact proceeds below the threshold (force)",
+    !!man?.compaction && takeCalls.length === nCallsBeforeThreshold + 1 && man.compaction.firstKeptEntryId === "f4");
+
+  // same KV anchor: raw history blows past the window (the old chars/4 bug) — must NOT fold
+  const nStoreBeforeSupp = storeLines();
+  const nCallsBeforeSupp = takeCalls.length;
+  const supp = await handlers.context[0]({ type: "context", messages: [
+    { role: "toolResult", toolCallId: "old1", toolName: "bash", isError: false, timestamp: 500000, content: [{ type: "text", text: "z".repeat(400000) }] },
+    { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 900001 },
+  ] }, gateCtx);
+  await new Promise((r) => setTimeout(r, 60));
+  check("in-flight suppressed: 400k chars of already-measured history is not \"full\"",
+    supp === undefined && storeLines() === nStoreBeforeSupp && takeCalls.length === nCallsBeforeSupp);
+
+  // high anchor (measured 85k of a 100k window) -> in-flight must fold
+  handlers.message_end[0]({ type: "message_end", message: { role: "assistant", timestamp: 960000, usage: { input: 85000, cacheRead: 0, cacheWrite: 0 } } }, gateCtx);
+  const nStoreBeforeHot = storeLines();
+  const hot = await handlers.context[0]({ type: "context", messages: [
+    { role: "user", content: [{ type: "text", text: "go" }], timestamp: 960001 },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "h".repeat(600) },
+      { type: "toolCall", id: "tH1", name: "bash", arguments: { command: "q" } } ], timestamp: 960002 },
+    { role: "toolResult", toolCallId: "tH1", toolName: "bash", isError: false, timestamp: 960003, content: [{ type: "text", text: "OUT ".repeat(400) }] },
+    { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "tH2", name: "bash", arguments: { command: "w" } }], timestamp: 960004 },
+  ] }, gateCtx);
+  await new Promise((r) => setTimeout(r, 60));
+  check("in-flight fires when the MEASURED prompt is actually near-full",
+    storeLines() === nStoreBeforeHot + 1 && hot?.messages?.some((m) => m.role === "toolResult" && String(m.content?.[0]?.text).startsWith("[golden]")) === true);
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

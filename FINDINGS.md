@@ -526,3 +526,58 @@ net for installs without that settings file. Evidence calls are time-bounded
 Verified: offline 110/110; replay matrix green (plugin arms' `compact` step produced
 `compaction` entries with `fromHook:true` + our pointer summary + correct
 `firstKeptEntryId`; `plugin-hang` still wedges pi's summarizer on demand); loader PASS.
+
+## 14. Compaction-hierarchy sizing bug: chat history instead of KV (2026-10-11)
+
+**Symptom (user report):** "Pi is reading context size from the chat window history
+instead of from the KV cache. The result is that Pi thinks context is full when it isn't
+and keeps triggering compaction."
+
+### Where pi sizes the context (0.86.1)
+
+| path | sizing input | verdict |
+|---|---|---|
+| `calculateContextTokens(usage)` (`dist/core/compaction/compaction.js`) | `usage.totalTokens \|\| input+output+cacheRead+cacheWrite`. Their `llamacpp` provider (`api: "openai-completions"`) computes `input = prompt − cached − write` per response, so `totalTokens = prompt + completion` — the KV truth **for that response**. | correct |
+| `estimateContextTokens(messages)` | anchors on the last assistant usage **found in the message list**, plus `estimateTokens` (chars/4, self-described *"conservative (overestimates)"*) for everything after it; **with no usable anchor it sums chars/4 over the entire chat window**. | history-based fallback |
+| `_checkCompaction` (`agent-session.js:1752`, threshold case) | direct usage when valid; falls back to `estimateContextTokens` on `stopReason === "error"` / zero usage — and **has** a stale-usage guard: *"Kept pre-compaction messages have stale usage reflecting the old (larger) context and would falsely trigger compaction right after one just finished."* | guarded |
+| `_compactBeforeNextAssistantResponse` (`agent-session.js:282`), installed as the per-turn `prepareNextTurn` refresh — runs **before every assistant response** | `shouldCompact(estimateContextTokens(context.messages)…)` **unconditionally: no direct-usage path, no stale guard**, evaluated over RAW session messages (pre-purge). | **the bug** |
+
+Reproduced against pi's own exports (`node` + `dist/core/compaction/index.js`, window
+96 000, reserve 16 384):
+
+- **stale anchor**: kept reply with `usage.totalTokens = 84000` (measured pre-compaction)
+  + 2k trailing estimate → `estimateContextTokens = 86000` → `shouldCompact = true`,
+  while the real KV prompt after our purge is ≈ **6 000**.
+- **no usable usage** (error/zero-usage sessions): pure history estimate of two large
+  tool outputs → `200 002` → `shouldCompact = true` regardless of what the KV holds.
+
+So the hierarchy fired from *stored conversation size*, not *measured cache occupancy* —
+"full" whenever history was big, repeatedly, since raw history never shrinks (our purge
+keeps it in the store by design; pi's compaction keeps kept entries too).
+
+### Our side had the same defect
+
+The in-flight trigger sized `estimateContextChars(runSystemPrompt, rawMessages)/4` —
+exactly the raw chat window — so a checkpointed session (huge store, tiny wire) read
+"full" at `contextFullPct` and force-checkpointed in a loop. Same disease, ours.
+
+### Fix (golden-context)
+
+1. **`KvAnchor`** — on every `message_end`, record the **measured prompt tokens of that
+   response's request** (`input + cacheRead + cacheWrite` — what actually sat in the KV
+   cache) + the assistant message ts + the rendered system-prompt byte size.
+2. **`estimateContextSize(system, messages, anchor)`** (golden-core) = anchor + chars/4
+   of **only messages dated after the anchor** + system-prompt growth. Cold start (no
+   measurement yet) falls back to the full history estimate — once, until the first
+   response lands.
+3. **In-flight trigger** sizes from the anchored number instead of the whole window.
+4. **Takeover gate**: `session_before_compact` with `reason: "threshold"` re-checks the
+   anchored size first — below `contextFullPct` → `{cancel: true}` (pi's false positive
+   neutralized with zero model calls). `reason: "manual"` (`/compact`) and `"overflow"`
+   (the engine itself refused) always proceed.
+5. The footer counter is unchanged: display-only and honestly labeled `est`.
+
+**Verified:** offline **118/118** (new: anchor/core sizing, threshold-gate cancel with no
+evidence call, suppression against 400k chars of already-measured history,
+manual-below-threshold proceeds, fires-when-measured-high); replay matrix green (all arms
+as designed; auto-threshold cancels cleanly, `plugin-hang` wedge intact); loader PASS.

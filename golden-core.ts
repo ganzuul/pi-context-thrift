@@ -569,6 +569,41 @@ export function estimateContextChars(system: string, messages: AnyMessage[]): nu
   return n;
 }
 
+/**
+ * ENGINE-MEASURED anchor for "how full is the context": the prompt tokens that actually
+ * sat in the KV cache for the last response (provider usage: input + cacheRead +
+ * cacheWrite), plus the rendered system-prompt size at that point. Compaction triggers
+ * must size from this instead of re-counting the raw chat window: the session store
+ * intentionally keeps full message bodies that never reach the wire after a purge, and
+ * pi's own threshold check falls back to chars/4 history estimates (or stale
+ * pre-compaction usage) — both overestimate badly and re-trigger compaction when the
+ * context is nowhere near full (findings §14).
+ */
+export interface KvAnchor {
+  /** measured prompt tokens of the request that produced the anchor response */
+  tokens: number;
+  /** timestamp of that assistant message */
+  ts: number;
+  /** utf8 bytes of the rendered system prompt at anchor time */
+  systemChars: number;
+}
+
+/**
+ * KV-anchored context size in tokens: the anchor + chars/4 of ONLY what was added since
+ * (messages dated after the anchor + system-prompt growth). Never re-counts history that
+ * was already measured. Falls back to the full history estimate before the first
+ * measured response (cold start).
+ */
+export function estimateContextSize(system: string, messages: AnyMessage[], anchor: KvAnchor | undefined): number {
+  if (!anchor) return Math.ceil(estimateContextChars(system, messages) / 4);
+  let delta = Math.max(0, Buffer.byteLength(system ?? "", "utf8") - anchor.systemChars);
+  for (const m of messages) {
+    const ts = typeof m.timestamp === "number" ? m.timestamp : 0;
+    if (ts > anchor.ts) delta += estimateContextChars("", [m]) - 8;
+  }
+  return anchor.tokens + Math.ceil(delta / 4);
+}
+
 /** 1234 -> "1.2k"; token-count formatting for counters. */
 export function formatTokens(tok: number): string {
   const t = Math.max(0, Math.round(tok));

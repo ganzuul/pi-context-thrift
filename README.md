@@ -4,7 +4,7 @@
 harness.** Evicts thinking and tool output while waiting for the user, replaced by short
 inferred evidence.
 
-> **Status: alpha** (`v0.2.0-alpha.1`) — verified against pi **0.86.1** (real wire-level
+> **Status: alpha** (`v0.2.0-alpha.2`) — verified against pi **0.86.1** (real wire-level
 > checks: prefill is a byte-exact prefix of the next request, takeover compaction entries,
 > loader acceptance). Expect API drift on future pi releases — see
 > [Known limitations](#known-limitations-alpha).
@@ -35,8 +35,8 @@ Three triggers, one machinery (`commitCheckpoint`):
 | trigger | when |
 |---|---|
 | **idle** | `agent_settled` — after each finished turn (+ warm prefill) |
-| **in-flight** | the `context` hook — when the outgoing request crosses `contextFullPct` (default **80 %**) of the model window, fold *before the request goes out*, mid-run included |
-| **takeover** | `session_before_compact` — `/compact` (and any pi compaction entry point) runs **our** compaction instead of pi's summarizer |
+| **in-flight** | the `context` hook — when the **measured** context (last response's KV usage + growth since) crosses `contextFullPct` (default **80 %**) of the model window, fold *before the request goes out*, mid-run included |
+| **takeover** | `session_before_compact` — `/compact` (and any pi compaction entry point) runs **our** compaction instead of pi's summarizer; pi's `threshold` triggers are re-verified against the measured size first and **cancelled when the window isn't actually near full** (`manual` and `overflow` always proceed) |
 
 ## Install
 
@@ -147,7 +147,7 @@ built-in defaults.
 |---|---|---|
 | `enabled` | `true` | master switch (`false` = full no-op) |
 | `autoCheckpoint` | `true` | run checkpoints (idle + in-flight) automatically |
-| `contextFullPct` | `80` | % of model window that triggers the in-flight fold |
+| `contextFullPct` | `80` | % of the model window (measured, KV-anchored size) that triggers the in-flight fold |
 | `takeoverCompaction` | `true` | `/compact` & pi triggers run our compaction (set `false` to A/B against pi's built-in behavior) |
 | `checkpointPolicy` | `"with-tools"` | only checkpoint turns that made tool calls (`"always"` = every turn) |
 | `summaryMaxTokens` / `summaryTargetTokens` | `512` / `128` | evidence call caps |
@@ -195,6 +195,12 @@ built-in defaults.
   (`convertToLlm`-style), matching pi's pipeline exactly — verified: the prefill body is a
   strict prefix of the next real request (21573/21574 chars; only the trailing new user
   message differs), system + tools byte-identical.
+- **All triggers size from an engine-measured anchor**, never from the chat history: the
+  prompt tokens of the last response (`input + cacheRead + cacheWrite` — what actually sat
+  in the KV cache) plus a chars/4 estimate of only what was added since. Raw history reads
+  "full" while the cache is mostly empty; pi's own threshold check falls back to exactly
+  that (stale pre-compaction usage or whole-window estimates — findings §14), which is why
+  the takeover gate exists.
 - Evidence calls are capped (`maxTokens` 512, `timeoutMs` 20000) — bounded by construction.
 
 Design rationale, reproduction recipes, and every verified assumption:
@@ -221,6 +227,9 @@ node test/loader-probe.mjs <agentDir>   # pi's real loader accepts the extension
 - **Version drift**: verified on pi 0.86.1; the extension API is young. Hook-signature
   drift fails loudly at load; drift in pi's `convertToLlm` strings degrades warm prefill
   to a cache miss (safe, never corrupt).
+- **Cold start**: until the first response lands there is no measurement to anchor on, so
+  the very first request is sized with the full-history estimate (bounds the problem only
+  until usage arrives).
 - **Prefill degrades** if another extension appends a custom system-prompt section *after*
   the golden one: the splice gate refuses and skips the prefill (nothing else breaks).
 - **No rescue for a single oversized message**: if one message alone exceeds the window,

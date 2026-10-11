@@ -1,6 +1,6 @@
 {
   "name": "pi-context-thrift",
-  "version": "0.2.0-alpha.1",
+  "version": "0.2.0-alpha.2",
   "description": "In-flight compaction for pi: evicts thinking and tool output while waiting for the user, replaced by short inferred evidence. Idle + context-full checkpoints, warm prefill, live context counter.",
   "license": "Apache-2.0",
   "type": "module",
