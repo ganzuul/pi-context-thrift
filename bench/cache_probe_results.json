@@ -1,0 +1,64 @@
+{
+  "cases": [
+    {
+      "label": "A seed",
+      "prompt_tokens": 2687,
+      "cached_tokens": 0,
+      "prompt_ms": 6254.911,
+      "prompt_n": 2687
+    },
+    {
+      "label": "B reuse",
+      "prompt_tokens": 2689,
+      "cached_tokens": 2560,
+      "prompt_ms": 1175.995,
+      "prompt_n": 129
+    },
+    {
+      "label": "C mutate-head",
+      "prompt_tokens": 2663,
+      "cached_tokens": 0,
+      "prompt_ms": 5050.529,
+      "prompt_n": 2663
+    },
+    {
+      "label": "D append-only",
+      "prompt_tokens": 2692,
+      "cached_tokens": 2560,
+      "prompt_ms": 1331.137,
+      "prompt_n": 132
+    }
+  ],
+  "sweep": [
+    {
+      "chars": 500,
+      "prompt_n": 466,
+      "prompt_ms": 2189.299,
+      "prompt_tps": 212.85352069315337
+    },
+    {
+      "chars": 2000,
+      "prompt_n": 1873,
+      "prompt_ms": 3137.475,
+      "prompt_tps": 596.9768683415805
+    },
+    {
+      "chars": 6000,
+      "prompt_n": 5040,
+      "prompt_ms": 7456.192,
+      "prompt_tps": 675.9482588431199
+    },
+    {
+      "chars": 12000,
+      "prompt_n": 10362,
+      "prompt_ms": 13781.443,
+      "prompt_tps": 751.8806267239214
+    },
+    {
+      "chars": 24000,
+      "prompt_n": 17438,
+      "prompt_ms": 22877.807,
+      "prompt_tps": 762.2234071648563
+    }
+  ]
+}

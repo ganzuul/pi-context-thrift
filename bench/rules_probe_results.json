@@ -1,0 +1,44 @@
+{
+  "ceiling": [
+    {
+      "units": 200,
+      "prompt": 1500,
+      "seed_ms": 3031,
+      "resend_cached": 1499,
+      "resend_ms": 2969,
+      "reuse": 0.999
+    },
+    {
+      "units": 400,
+      "prompt": 3100,
+      "seed_ms": 4715,
+      "resend_cached": 3099,
+      "resend_ms": 4689,
+      "reuse": 1.0
+    },
+    {
+      "units": 800,
+      "prompt": 6300,
+      "seed_ms": 9003,
+      "resend_cached": 6299,
+      "resend_ms": 8994,
+      "reuse": 1.0
+    },
+    {
+      "units": 1200,
+      "prompt": 10900,
+      "seed_ms": 14889,
+      "resend_cached": 10899,
+      "resend_ms": 14886,
+      "reuse": 1.0
+    },
+    {
+      "units": 1800,
+      "prompt": 16900,
+      "seed_ms": 22914,
+      "resend_cached": 16899,
+      "resend_ms": 22829,
+      "reuse": 1.0
+    }
+  ]
+}

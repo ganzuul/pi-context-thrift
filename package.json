@@ -1,0 +1,20 @@
+{
+  "name": "pi-context-thrift",
+  "version": "0.2.0-alpha.1",
+  "description": "In-flight compaction for pi: evicts thinking and tool output while waiting for the user, replaced by short inferred evidence. Idle + context-full checkpoints, warm prefill, live context counter.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "pi": {
+    "extensions": ["golden-context.ts"]
+  },
+  "info": {
+    "install": "pi install git:github.com/ganzuul/pi-context-thrift",
+    "requires": "pi >= 0.86 (verified against 0.86.1)",
+    "store": "<agentDir>/golden-context/golden.jsonl (append-only; honors PI_CODING_AGENT_DIR)",
+    "env": {
+      "PI_GOLDEN_DUMP": "1 | <path> — record every provider request body (what the LLM actually sees)",
+      "PI_GOLDEN_DEBUG": "1 — trace prefill/skip decisions",
+      "PI_GOLDEN_CONFIG": "<path> — alternate config file"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# Never commit session data (privacy — the repo ships no fixtures by design).
+# Point PI_REPLAY_FIXTURE at a session file of your own instead.
+test/fixtures/*.jsonl
+
+# PI_GOLDEN_DUMP / local run artifacts
+*.requests.jsonl
+node_modules/

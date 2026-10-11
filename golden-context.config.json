@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+
+  "autoCheckpoint": true,
+  "contextFullPct": 80,
+  "takeoverCompaction": true,
+  "checkpointPolicy": "with-tools",
+  "summaryMaxTokens": 512,
+  "summaryTargetTokens": 128,
+  "callLineMaxChars": 160,
+  "hollowCoveredText": true,
+  "prefillAfterCheckpoint": true,
+
+  "tailKeepToolResults": 4,
+  "autoEjectOldToolResults": false,
+  "minResultBytesToEject": 2048,
+  "stripThinkingOnSpend": true,
+  "maxGoldenSectionBytes": 16000,
+  "goldenStoreRel": "golden-context/golden.jsonl",
+  "handleTemplate": "[golden] {toolName} #{id} ejected ({bytes}B) — consumed into later work"
+}
