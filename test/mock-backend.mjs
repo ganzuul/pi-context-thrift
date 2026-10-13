@@ -201,7 +201,7 @@ const server = createServer((req, res) => {
       sse(res, chunk({ choices: [{ index: 0, delta: { role: "assistant", reasoning_content: "I should commit a decision." }, finish_reason: null }] }));
       const args = JSON.stringify({
         decision: "distill",
-        text: "Mock hindsight line for offline verification of DISTILL ejection.",
+        text: process.env.MOCK_COMMIT_TEXT || "Mock hindsight line for offline verification of DISTILL ejection.",
         spendToolCallIds: ids,
       });
       sse(res, chunk({

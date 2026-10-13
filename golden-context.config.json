@@ -16,6 +16,7 @@
   "minResultBytesToEject": 2048,
   "stripThinkingOnSpend": true,
   "maxGoldenSectionBytes": 16000,
+  "scope": "cwd",
   "goldenStoreRel": "golden-context/golden.jsonl",
   "handleTemplate": "[golden] {toolName} #{id} ejected ({bytes}B) — consumed into later work"
 }

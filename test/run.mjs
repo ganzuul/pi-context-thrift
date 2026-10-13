@@ -291,6 +291,39 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
   check("dry-run classifies fold-text + eject-result + strip", planDry.items.some((i) => i.action === "fold-text") && planDry.items.some((i) => i.action === "eject-result"));
 }
 
+// ---- store scoping (the bug: one global store leaked every project's golden into new dirs) ----
+{
+  const s = core.parseConfig({});
+  check("default scope is cwd (fresh context per directory)", s.scope === "cwd");
+  check("scope:global / scope:git honored",
+    core.parseConfig({ scope: "global" }).scope === "global" && core.parseConfig({ scope: "git" }).scope === "git");
+  check("invalid scope falls back to cwd", core.parseConfig({ scope: "nonsense" }).scope === "cwd");
+
+  // must match pi's OWN per-directory session naming, not an invention of ours
+  check("encodeCwdScope: posix path", core.encodeCwdScope("/srv/users/dev/projects/alpha") === "--srv-users-dev-projects-alpha--");
+  check("encodeCwdScope: strips leading slash, maps : and \\ to -",
+    core.encodeCwdScope("/C:/Users/me/proj") === "--C--Users-me-proj--");
+
+  const dirs = new Set(["/repo/.git", "/repo/sub/other"]);
+  check("findGitRoot: nearest ancestor with .git", core.findGitRoot("/repo/sub/pkg", (p) => dirs.has(p)) === "/repo");
+  check("findGitRoot: worktree/submodule (.git FILE)", core.findGitRoot("/repo/x", (p) => p === "/repo/.git") === "/repo");
+  check("findGitRoot: null outside a repo", core.findGitRoot("/a/b", () => false) === null);
+
+  check("scopeKeyFor: global -> null (historic single store)",
+    core.scopeKeyFor({ scope: "global" }, "/x/y", null) === null);
+  check("scopeKeyFor: git uses the repo root",
+    core.scopeKeyFor({ scope: "git" }, "/repo/sub", "/repo") === "--repo--");
+  check("scopeKeyFor: git degrades to cwd when not a repo",
+    core.scopeKeyFor({ scope: "git" }, "/loose/dir", null) === "--loose-dir--");
+  check("scopeKeyFor: cwd ignores the git root",
+    core.scopeKeyFor({ scope: "cwd" }, "/repo/sub", "/repo") === "--repo-sub--");
+}
+
+// Deterministic launch dir for the adapter tests: the store is scoped per directory, so this
+// fixture cwd decides where the adapter reads/writes golden.jsonl.
+const FIXTURE_CWD = "/golden-fixture-project";
+const STORE = join(AGENT, "golden-context", core.encodeCwdScope(FIXTURE_CWD), "golden.jsonl");
+
 // ---- ADAPTER end-to-end via the stubbed pi surface ----
 const adapter = jiti(join(__dirname, "..", "golden-context.ts"));
 const handlers = {};
@@ -309,7 +342,7 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
 
 // drive session_start (fresh store), commit via tool, then assert golden section + spend
 (async () => {
-  await handlers.session_start[0]({}, {});
+  await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
   const toolRes = await registeredTools.commit_decision.execute("tc1", { decision: "record", text: "lower ctx to free VRAM", spendToolCallIds: ["id9"] }, undefined, undefined, { cwd: process.cwd() });
   check("commit returns confirmation text", typeof toolRes.content?.[0]?.text === "string" && /Golden committed/.test(toolRes.content[0].text));
 
@@ -328,7 +361,7 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   // IN-FLIGHT compaction trigger needs a ctx; existing tests pass {} (no model -> no trigger)
   const r = await handlers.context[0](ev2, {});
   check("absolute tail: in-tail explicit spend NOT pruned (returns undefined)", r === undefined);
-  check("store file was written durably", (() => { try { const { existsSync, readFileSync } = require("node:fs"); const p = join(AGENT, "golden-context", "golden.jsonl"); return existsSync(p) && /lower ctx to free VRAM/.test(readFileSync(p, "utf8")); } catch { return false; } })());
+  check("store file was written durably", (() => { try { const { existsSync, readFileSync } = require("node:fs"); return existsSync(STORE) && /lower ctx to free VRAM/.test(readFileSync(STORE, "utf8")); } catch { return false; } })());
 
   // ---- discrete commands through a fake command context ----
   const notices = [], widgets = [];
@@ -355,7 +388,7 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   check("/golden-commit appends + notifies", beforeSeq && notices.some((n) => /Golden committed \[\d+\] distill/.test(n) && /1 tool output/.test(n)));
   {
     const { readFileSync } = require("node:fs");
-    const lines = readFileSync(join(AGENT, "golden-context", "golden.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const lines = readFileSync(STORE, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     const last = lines[lines.length - 1];
     check("/golden-commit persisted kind+spend", last.kind === "distill" && last.spend.includes("cmdA") && /hindsight from the old session/.test(last.text));
   }
@@ -368,14 +401,14 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   // with tailKeep=0 the same dry run plans the ejection of the spent result
   const { writeFileSync } = require("node:fs");
   writeFileSync(join(AGENT, "golden-context", "config.json"), JSON.stringify({ tailKeepToolResults: 0 }));
-  await handlers.session_start[0]({}, {}); // reload config from disk
+  await handlers.session_start[0]({}, { cwd: FIXTURE_CWD }); // reload config from disk
   notices.length = 0;
   await registeredCommands["golden-eject"].handler("", fakeCtx);
   check("/golden-eject plans ejection past the tail", notices.some((n) => /would change 1 message/.test(n) && /eject-result .*cmdA/.test(n)));
 
   // ---- idle checkpointing through agent_settled (background, model call stubbed) ----
   const { readFileSync } = require("node:fs");
-  const storePath = join(AGENT, "golden-context", "golden.jsonl");
+  const storePath = STORE;
   // the run prompt must be self-consistent: its golden section = the render of what is
   // actually in the store at before_agent_start time (the splice verifies exactly this)
   const preLines = readFileSync(storePath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
@@ -638,6 +671,39 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   await new Promise((r) => setTimeout(r, 60));
   check("in-flight fires when the MEASURED prompt is actually near-full",
     storeLines() === nStoreBeforeHot + 1 && hot?.messages?.some((m) => m.role === "toolResult" && String(m.content?.[0]?.text).startsWith("[golden]")) === true);
+
+  // ---- SCOPE ISOLATION (the reported bug): another directory must start with a FRESH golden ----
+  {
+    const { existsSync, readFileSync } = require("node:fs");
+    const OTHER_CWD = "/golden-other-project";
+    const OTHER_STORE = join(AGENT, "golden-context", core.encodeCwdScope(OTHER_CWD), "golden.jsonl");
+    const fixtureLinesBefore = storeLines();
+
+    await handlers.session_start[0]({}, { cwd: OTHER_CWD });
+    const evFresh = { systemPromptOptions: { sections: {} } };
+    handlers.before_agent_start[0](evFresh, { cwd: OTHER_CWD });
+    check("new directory renders NO golden from the other project",
+      !String(evFresh.systemPromptOptions.sections.golden ?? "").includes("lower ctx to free VRAM"));
+
+    await registeredTools.commit_decision.execute(
+      "tcOTHER", { decision: "record", text: "UNIQUE-OTHER-PROJECT-DECISION", spendToolCallIds: [] },
+      undefined, undefined, { cwd: OTHER_CWD });
+    check("commit in the other scope writes ONLY its own store",
+      existsSync(OTHER_STORE) && readFileSync(OTHER_STORE, "utf8").includes("UNIQUE-OTHER-PROJECT-DECISION"));
+    check("the original scope's store is untouched by the other project",
+      storeLines() === fixtureLinesBefore && !readFileSync(storePath, "utf8").includes("UNIQUE-OTHER-PROJECT-DECISION"));
+    check("scoped stores are siblings under the agent dir, each in its own scope dir",
+      OTHER_STORE !== storePath
+        && OTHER_STORE.startsWith(join(AGENT, "golden-context") + "/")
+        && OTHER_STORE.includes(core.encodeCwdScope(OTHER_CWD))
+        && storePath.includes(core.encodeCwdScope(FIXTURE_CWD)));
+
+    await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+    const evBack = { systemPromptOptions: { sections: {} } };
+    handlers.before_agent_start[0](evBack, { cwd: FIXTURE_CWD });
+    check("returning to the original directory restores ITS golden",
+      String(evBack.systemPromptOptions.sections.golden ?? "").includes("lower ctx to free VRAM"));
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

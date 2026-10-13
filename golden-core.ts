@@ -44,6 +44,9 @@ const TOOLCALL_TYPES = new Set(["toolCall", "tool_call", "functionCall", "functi
 
 // ---- config ----
 
+/** What a golden store is scoped to. See `scopeKeyFor` for the resolution rules. */
+export type StoreScope = "cwd" | "git" | "global";
+
 export interface GoldenConfig {
   /** master switch; when false the adapter is a no-op. */
   enabled: boolean;
@@ -84,6 +87,11 @@ export interface GoldenConfig {
   stripThinkingOnSpend: boolean;
   /** cap on the rendered golden section (bytes) so a runaway log cannot blow the prefix. */
   maxGoldenSectionBytes: number;
+  /** What the store is scoped to. "cwd" = the directory pi was launched in (a new project starts
+   *  with a FRESH golden instead of inheriting another project's decisions); "git" = nearest
+   *  ancestor with a .git, so subdirs of one repo share memory; "global" = the historic single
+   *  machine-wide store. The scope key nests inside goldenStoreRel's own directory. */
+  scope: StoreScope;
   /** store file, resolved relative to the agent dir by the adapter. */
   goldenStoreRel: string;
   /** handle template; placeholders {toolName} {id} {bytes} */
@@ -106,6 +114,7 @@ export const DEFAULT_CONFIG: GoldenConfig = {
   minResultBytesToEject: 2048,
   stripThinkingOnSpend: true,       // the DISTILL rule is the point; conservative elsewhere
   maxGoldenSectionBytes: 16_000,
+  scope: "cwd",                    // a new directory must NOT inherit another project's golden
   goldenStoreRel: "golden-context/golden.jsonl",
   handleTemplate: "[golden] {toolName} #{id} ejected ({bytes}B) — consumed into later work",
 };
@@ -134,9 +143,53 @@ export function parseConfig(raw: unknown): GoldenConfig {
     minResultBytesToEject: Math.max(0, Math.floor(num(o.minResultBytesToEject, DEFAULT_CONFIG.minResultBytesToEject))),
     stripThinkingOnSpend: typeof o.stripThinkingOnSpend === "boolean" ? o.stripThinkingOnSpend : DEFAULT_CONFIG.stripThinkingOnSpend,
     maxGoldenSectionBytes: Math.max(0, Math.floor(num(o.maxGoldenSectionBytes, DEFAULT_CONFIG.maxGoldenSectionBytes))),
+    scope: o.scope === "cwd" || o.scope === "git" || o.scope === "global"
+      ? o.scope : DEFAULT_CONFIG.scope,
     goldenStoreRel: typeof o.goldenStoreRel === "string" && o.goldenStoreRel ? o.goldenStoreRel : DEFAULT_CONFIG.goldenStoreRel,
     handleTemplate: typeof o.handleTemplate === "string" && o.handleTemplate ? o.handleTemplate : DEFAULT_CONFIG.handleTemplate,
   };
+}
+
+// ---- store scoping (pure: the fs probe is injected by the adapter) ----
+
+/**
+ * Scope key for a directory — byte-identical to pi's own per-directory session naming
+ * (`--${abs.replace(/^[/\\]/,"").replace(/[/\\:]/g,"-")}--`, pi session-manager.js:248) so a
+ * store can be read against `sessions/--<same key>--/`. pi does not export this helper, so it is
+ * copied deliberately; `test/run.mjs` pins it against pi's real, on-disk directory names.
+ */
+export function encodeCwdScope(absPath: string): string {
+  return `--${absPath.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+}
+
+/**
+ * Nearest ancestor containing `.git` — as a dir OR a file, since worktrees/submodules use the
+ * file form. `exists` is injected to keep this pure/testable. Returns null outside any repo.
+ */
+export function findGitRoot(startAbs: string, exists: (p: string) => boolean): string | null {
+  let dir = startAbs.replace(/\/+$/, "") || "/";
+  for (;;) {
+    if (exists(`${dir}/.git`)) return dir;
+    if (dir === "/") return null;
+    const parent = dir.replace(/\/[^/]+$/, "");
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * The directory segment a store lives under, or null for the historic single machine-wide store.
+ * "git" degrades to "cwd" when the launch dir is not inside a repo — an un-repoed directory has
+ * no better key than itself.
+ */
+export function scopeKeyFor(
+  cfg: Pick<GoldenConfig, "scope">,
+  cwd: string,
+  gitRoot: string | null,
+): string | null {
+  if (cfg.scope === "global") return null;
+  if (cfg.scope === "git" && gitRoot) return encodeCwdScope(gitRoot);
+  return encodeCwdScope(cwd);
 }
 
 // ---- golden store records ----

@@ -159,7 +159,8 @@ built-in defaults.
 | `minResultBytesToEject` | `2048` | auto-eject size floor (text-only results) |
 | `stripThinkingOnSpend` | `true` | strip thinking of explicitly-spent turns (DISTILL) |
 | `maxGoldenSectionBytes` | `16000` | render cap for the `<golden>` section (oldest lines drop) |
-| `goldenStoreRel` | `golden-context/golden.jsonl` | store path relative to the agent dir |
+| `scope` | `cwd` | store scoping: `cwd` (one store per launch directory), `git` (one per repo, `cwd` fallback), or `global` (single machine-wide store — the behavior before store scoping existed) |
+| `goldenStoreRel` | `golden-context/golden.jsonl` | store path relative to the agent dir; the `scope` key is inserted as a directory segment |
 | `handleTemplate` | see config | the eject-handle text |
 
 ## Environment variables
@@ -173,8 +174,11 @@ built-in defaults.
 
 ## Where your data lives
 
-- **Golden store**: `<agentDir>/golden-context/golden.jsonl` — append-only JSONL. The
-  `agentDir` honors `PI_CODING_AGENT_DIR`, so it is portable and isolatable.
+- **Golden store**: `<agentDir>/golden-context/<scope>/golden.jsonl` — append-only JSONL, scoped by
+  launch directory (`scope`, default `cwd`) so a new project starts with a fresh golden instead of
+  inheriting another project's decisions. `<scope>` uses pi's own per-directory naming
+  (`--some-repo-subdir--`), so it lines up with `sessions/--…--`; `PI_CODING_AGENT_DIR` still
+  relocates the whole thing, keeping it portable and isolatable.
 - **This repo ships no session data.** The replay harness needs a session JSONL of your
   own (`PI_REPLAY_FIXTURE=…`); it copies the file per test arm and never modifies the
   original.
@@ -209,7 +213,9 @@ Design rationale, reproduction recipes, and every verified assumption:
 ## Development & tests
 
 ```sh
-node test/run.mjs          # offline suite — no GPU, no model, no pi startup (110 checks)
+node test/run.mjs          # offline suite — no GPU, no model, no pi startup (135 checks)
+./test/scope-e2e.sh        # real pi, two directories, no GPU: proves per-directory golden
+                           # negative control: SCOPE_OVERRIDE=global ./test/scope-e2e.sh must FAIL
 ./test/replay.sh [arm]     # drives REAL pi over RPC against a mock backend
                            # arms: pi-only | plugin | plugin-eject | plugin-ckpt | plugin-hang
 node test/loader-probe.mjs <agentDir>   # pi's real loader accepts the extension

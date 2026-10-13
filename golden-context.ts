@@ -27,7 +27,7 @@
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { Type } from "typebox";
 // value imports — these are what the isolated test stubs out
 import { buildSessionContext, getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -46,6 +46,7 @@ import {
   entryToJsonLine,
   estimateContextChars,
   estimateContextSize,
+  findGitRoot,
   formatStatus,
   formatTokens,
   parseCommitArgs,
@@ -53,6 +54,7 @@ import {
   parseGoldenLine,
   renderGoldenSection,
   resolveToolLoadout,
+  scopeKeyFor,
   spliceGoldenSection,
   toLlmMessages,
   type AnyMessage,
@@ -88,6 +90,8 @@ interface LiveState {
   cfg: GoldenConfig;
   entries: GoldenEntry[];
   seq: number;
+  /** launch dir the live store is currently scoped to (see config `scope`) */
+  cwd: string;
   /** rendered system prompt of the active run (golden section included) — the prefill splice base */
   runSystemPrompt?: string | undefined;
   /** the golden section text as injected for the active run (strict prefix of any later render) */
@@ -105,9 +109,20 @@ interface LiveState {
   kvAnchor?: KvAnchor | undefined;
 }
 
-function resolveStorePath(cfg: GoldenConfig): string {
-  // Golden store sits under the agent dir (honors PI_CODING_AGENT_DIR => isolated testing).
-  return join(getAgentDir(), cfg.goldenStoreRel);
+/**
+ * Golden store path, SCOPED by launch directory (config `scope`).
+ *
+ * Was a single machine-wide file, which meant pi started in project B inherited project A's
+ * golden lines — the opposite of a fresh context. The scope key nests inside goldenStoreRel's
+ * own directory, so `<agentDir>/golden-context/<--cwd-->/golden.jsonl`.
+ * `scope:"global"` reproduces the old path exactly for anyone who wants it back.
+ */
+function resolveStorePath(cfg: GoldenConfig, cwd: string): string {
+  const gitRoot = cfg.scope === "git" ? findGitRoot(cwd, existsSync) : null;
+  const key = scopeKeyFor(cfg, cwd, gitRoot);
+  const rel = cfg.goldenStoreRel;
+  const base = isAbsolute(rel) ? dirname(rel) : join(getAgentDir(), dirname(rel));
+  return key ? join(base, key, basename(rel)) : join(base, basename(rel));
 }
 
 function loadConfig(): GoldenConfig {
@@ -167,9 +182,25 @@ function dumpRequest(source: "agent" | "evidence" | "prefill", payload: unknown)
 }
 
 export default function goldenContextExtension(pi: ExtensionAPI): void {
-  const state: LiveState = { cfg: loadConfig(), entries: [], seq: 0, ckptInFlight: false };
+  const state: LiveState = { cfg: loadConfig(), entries: [], seq: 0, cwd: process.cwd(), ckptInFlight: false };
 
   const refresh = (): Set<string> => collectSpentIds(state.entries);
+
+  /**
+   * Adopt a launch dir: point the live store at that scope and load its own entries.
+   * No-op while the dir is unchanged, so hooks can call it defensively on every event.
+   * Returns true when the scope (and therefore `state.entries`) actually changed.
+   */
+  function adoptScope(cwd: unknown): boolean {
+    if (typeof cwd !== "string" || !cwd || cwd === state.cwd) return false;
+    state.cwd = cwd;
+    const storePath = resolveStorePath(state.cfg, state.cwd);
+    ensureStoreDir(storePath);
+    const { entries, seq } = loadEntries(storePath);
+    state.entries = entries;
+    state.seq = seq;
+    return true;
+  }
 
   /** Shared commit path for the `commit_decision` tool, `/golden-commit`, and idle checkpoints. */
   async function commitEntry(kind: DecisionKind, text: string, spend: string[], coveredTs?: number, keepTs?: number): Promise<GoldenEntry> {
@@ -182,7 +213,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       ...(coveredTs !== undefined ? { coveredTs } : {}),
       ...(keepTs !== undefined ? { keepTs } : {}),
     };
-    const storePath = resolveStorePath(state.cfg);
+    const storePath = resolveStorePath(state.cfg, state.cwd);
     ensureStoreDir(storePath);
     await appendLine(storePath, entryToJsonLine(entry));
     state.entries.push(entry);
@@ -236,17 +267,23 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     }
   }
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     state.cfg = loadConfig();
-    const storePath = resolveStorePath(state.cfg);
+    // The store is scoped by launch dir: a new project must start with a FRESH golden,
+    // not pi-ctx's or another repo's accumulated decisions. ctx.cwd is pi's own resolved
+    // session dir (ExtensionContext.cwd); process.cwd() only if a host hands us no context.
+    const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
+    state.cwd = cwd;
+    const storePath = resolveStorePath(state.cfg, state.cwd);
     ensureStoreDir(storePath);
     const { entries, seq } = loadEntries(storePath);
     state.entries = entries;
     state.seq = seq;
   });
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     if (!state.cfg.enabled) return;
+    adoptScope(ctx?.cwd); // scope can only have moved; re-point before rendering golden
     // Capture the exact rendered prompt for the idle prefill FIRST (even when no golden
     // section exists yet — the FIRST checkpoint appends the whole wrapped section).
     state.runSystemPrompt = event.systemPrompt;
@@ -262,6 +299,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
 
   pi.on("context", async (event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled) return;
+    adoptScope(ctx?.cwd); // pi fixes cwd per session, but commits must land in the right scope
     // IN-FLIGHT compaction — "our own solution for when context is full": if the request
     // about to go out crosses contextFullPct of the window, fold the covered history into
     // a checkpoint RIGHT HERE (mid-run), then purge below. The evidence call is bounded
@@ -597,7 +635,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.registerCommand("golden-status", {
     description: "Show golden-context state (store, config, spent toolCallIds, context usage)",
     handler: async (_args, ctx) => {
-      const storePath = resolveStorePath(state.cfg);
+      const storePath = resolveStorePath(state.cfg, state.cwd);
       const usage = ctx.getContextUsage();
       report(ctx, "golden-status", formatStatus({
         enabled: state.cfg.enabled,

@@ -581,3 +581,74 @@ exactly the raw chat window — so a checkpointed session (huge store, tiny wire
 evidence call, suppression against 400k chars of already-measured history,
 manual-below-threshold proceeds, fires-when-measured-high); replay matrix green (all arms
 as designed; auto-threshold cancels cleanly, `plugin-hang` wedge intact); loader PASS.
+
+## 15. Store scope bug (2026-10-13) — the golden log was machine-global, not per-project
+
+**Symptom (user report):** starting pi in a different directory was expected to give a fresh
+context, but the plugin carried one global context everywhere. Confirmed as a live defect.
+
+### Root cause
+
+`resolveStorePath()` returned `join(getAgentDir(), cfg.goldenStoreRel)` with
+`goldenStoreRel = "golden-context/golden.jsonl"`. The agent dir honors `PI_CODING_AGENT_DIR`
+but **never varies with the launch directory**, so every pi process on the machine read and wrote
+one file: `session_start` loaded it and `before_agent_start` rendered all of it into every new
+session's `<golden>` section.
+
+The first machine this shipped on had accumulated 48 entries spanning several unrelated projects,
+including pure noise (test prompts, duplicated entries). The cost goes beyond clutter: the render
+is append-only by design (prefix-cache stability), so a global store grows monotonically no matter
+where you work — one project's history permanently inflates every other project's system prompt,
+and it is injected as authoritative ("Do not re-derive or restate them"), which inverts the
+"less clutter / less drift" goal. `GoldenEntry` recorded no cwd, so a mixed store is not even
+attributable after the fact.
+
+### Fix: `scope` config key, default per-launch-directory
+
+| `scope` | store | effect |
+|---|---|---|
+| `"cwd"` (**default**) | `<agentDir>/golden-context/<encoded-cwd>/golden.jsonl` | a new directory starts fresh |
+| `"git"` | keyed by the nearest `.git` ancestor (dir **or** file, so worktrees/submodules count) | subdirs of one repo share memory; falls back to `cwd` outside a repo |
+| `"global"` | no key segment — exactly the historic path | old behavior, deliberately preserved |
+
+`encodeCwdScope()` is byte-identical to pi's own per-directory session naming
+(`--${resolvedCwd.replace(/^[/\\]/,"").replace(/[/\\:]/g,"-")}--`, `session-manager.js:248`) so a
+store can be lined up against `sessions/--<same key>--/`. pi does not export that helper
+(`index.d.ts` exposes `getAgentDir`, `buildSessionContext`, `SessionManager`, no encoder), so it is
+copied intentionally and pinned by tests rather than trusted. The helpers are pure with the fs
+probe injected (`encodeCwdScope`, `findGitRoot`, `scopeKeyFor`), so they unit-test without pi.
+
+Scope is adopted at `session_start` from `ExtensionContext.cwd` — verified genuinely delivered,
+since the runner's generic `emit()` does `handler(event, ctx)` (`runner.js:651-656`);
+`process.cwd()` is only a fallback for a host that supplies no context. `adoptScope()` re-points
+defensively on `before_agent_start`/`context`: pi fixes `cwd` per session (`setCwd` exists only
+for the footer display), so that guard is belt-and-braces, not a live requirement. `seq` restarts
+per store, which is correct — each store is its own monotonic append log. Config stays global by
+design (behavior settings, not data); only the store is scoped.
+
+### Verification — including proof the tests can fail
+
+- Offline `test/run.mjs`: **135 passed, 0 failed** (was 118). New: default scope is `cwd`;
+  `global`/`git` honored; invalid → `cwd`; `encodeCwdScope` posix + drive-letter form;
+  `findGitRoot` nearest-ancestor / `.git`-file / null outside a repo; `scopeKeyFor` all four
+  cases; plus an adapter **isolation** case — a session in dir A commits, a session in dir B
+  renders none of A's text, B's commit writes only B's store, A's store line count is unchanged,
+  and the two stores are sibling scope dirs.
+- `test/scope-e2e.sh` drives **real pi with no GPU** against `test/mock-backend.mjs`: dir A
+  commits → the store lands in A's scope dir; A again → the committed line IS in the system
+  prompt it sends; dir B → it is **NOT**. Exit 0.
+- **Negative control**, because a passing test that cannot fail proves nothing:
+  `SCOPE_OVERRIDE=global ./test/scope-e2e.sh` returns the store to the unscoped path and fails
+  the isolation assertion (`found=1 want=0`), exit 1.
+- Two harness bugs were found while writing this and fixed: the first draft asserted against
+  filenames it never wrote, so the key assertion passed **vacuously** on a missing file (`want()`
+  now fails on an empty capture, plus a positive sanity assertion that the payload was captured);
+  and an external `MOCK_COMMIT_TEXT` override desynced from the script's own canary, producing a
+  false FAIL (the script now derives one from the other).
+
+### Migration note
+
+Existing global stores are not auto-migrated: the new code simply reads a different path, leaving
+an old `<agentDir>/golden-context/golden.jsonl` in place, un-read. Entries carry no cwd, so a
+mixed store cannot be split reliably after the fact — rename it (e.g.
+`golden.jsonl.pre-scope-global`) rather than deleting it if you want to keep the history.
