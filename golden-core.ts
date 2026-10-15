@@ -237,6 +237,30 @@ export function parseGoldenLine(line: string): GoldenEntry | null {
   } catch { return null; }
 }
 
+/**
+ * Undo for the JSONL store (HARD TRUNCATE, user-chosen 2026-10-15): drop the last n
+ * non-empty lines, returning the remaining content and the removed raw lines. Pure —
+ * archiving/writing are the adapter's job. Re-writing the file is what breaks
+ * append-only purity here; the user weighed it against a soft-retract design and took
+ * the simpler store. Single-writer-per-scope is assumed (withFileMutationQueue only
+ * serializes within one process).
+ */
+export function truncateStoreContent(content: string, n: number): { keptText: string; removed: string[] } {
+  const lines = content.split("\n").filter((l) => l.trim() !== "");
+  const k = Math.min(Math.max(0, Math.floor(n)), lines.length);
+  const removed = lines.slice(lines.length - k);
+  const kept = lines.slice(0, lines.length - k);
+  return { keptText: kept.length ? kept.map((l) => `${l}\n`).join("") : "", removed };
+}
+
+/** "/golden-undo 3 ..." -> 3; empty/garbage -> 1; an explicit "0" -> 0 (caller reports). */
+export function parseUndoCount(args: string): number {
+  const m = /^\s*(\d+)/.exec(args ?? "");
+  if (!m) return 1;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? Math.max(0, n) : 1;
+}
+
 /** Coverage a checkpoint entry applies to every later request (the purge channel). */
 export function coverageFromEntry(e: GoldenEntry, cfg: Pick<GoldenConfig, "hollowCoveredText">): CheckpointCoverage | undefined {
   if (e.kind !== "checkpoint") return undefined;
@@ -838,6 +862,27 @@ export function spliceGoldenSection(runPrompt: string, oldRender: string, newRen
   const tail = oldRender + suffix;
   if (!runPrompt.endsWith(tail) || !newRender.startsWith(oldRender)) return null;
   return runPrompt.slice(0, -tail.length) + newRender + suffix;
+}
+
+/**
+ * Marker-swap fallback for `spliceGoldenSection`: replace whatever sits between pi's own
+ * `<golden>` … `</golden>` tags in the run prompt with `newRender`. Unlike the splice, this
+ * does NOT require the new render to be a strict prefix of the old one — the prefix check
+ * proves KV-cache continuity, but warm prefill only needs the bytes pi will actually send
+ * next, and pi re-renders the section from current entries inside these same tags.
+ * That is what keeps prefill alive exactly when the splice gives up: after a cap overflow
+ * (`renderGoldenSection` drops head lines) or a `/golden-undo` (render shrinks).
+ * Returns null when the markers are absent/ambiguous (we refuse to guess).
+ */
+export function replaceGoldenSection(runPrompt: string, newRender: string): string | null {
+  if (!newRender) return null;
+  const open = "\n<golden>\n";
+  const close = "\n</golden>";
+  const i = runPrompt.indexOf(open);
+  if (i === -1 || runPrompt.lastIndexOf(open) !== i) return null; // absent or ambiguous
+  const j = runPrompt.indexOf(close, i + open.length);
+  if (j === -1 || runPrompt.lastIndexOf(close) !== j) return null; // absent or ambiguous
+  return runPrompt.slice(0, i + open.length) + newRender + runPrompt.slice(j);
 }
 
 /**

@@ -25,7 +25,7 @@
  * until Gate A (cache-hit proof) is done.
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { Type } from "typebox";
@@ -52,11 +52,14 @@ import {
   parseCommitArgs,
   parseConfig,
   parseGoldenLine,
+  parseUndoCount,
   renderGoldenSection,
+  replaceGoldenSection,
   resolveToolLoadout,
   scopeKeyFor,
   spliceGoldenSection,
   toLlmMessages,
+  truncateStoreContent,
   type AnyMessage,
   type CheckpointCoverage,
   type CheckpointPlan,
@@ -96,6 +99,15 @@ interface LiveState {
   runSystemPrompt?: string | undefined;
   /** the golden section text as injected for the active run (strict prefix of any later render) */
   runGoldenRender?: string | undefined;
+  /** ground truth from the last real provider request: the exact system bytes the engine
+   *  received (the tools set already has its own resolver). The warm prefill rebuilds on
+   *  THESE bytes — live replay proved `event.systemPrompt` is the pre-section-mutation
+   *  render and contains no <golden> block, so reconstructing from it silently no-oped. */
+  wireSystem?: string | undefined;
+  /** one deferred warm-prefill re-check after a busy skip (see attemptWarm) */
+  warmRetry?: ReturnType<typeof setTimeout> | undefined;
+  /** bytes key of the last request we warmed — re-warming identical bytes is a no-op */
+  lastWarmKey?: string | undefined;
   /** idle checkpointing is a background task; guard against overlap */
   ckptInFlight: boolean;
   /** the in-flight checkpoint run (session_before_compact waits on it to serialize) */
@@ -151,6 +163,27 @@ function loadEntries(storePath: string): { entries: GoldenEntry[]; seq: number }
   }
 }
 
+/**
+ * Reload a store, but compute the next `seq` from the HIGH-WATER MARK of BOTH the live
+ * store and the undo archive (`golden.undone.jsonl` beside it). After /golden-undo pops
+ * the top entry, a plain reload would rewind seq and let a new commit reuse a number the
+ * archive already references — breaking "seq numbers never get reused" across restarts.
+ */
+function loadStoreWithWatermark(storePath: string): { entries: GoldenEntry[]; seq: number } {
+  const cur = loadEntries(storePath);
+  let seq = cur.seq;
+  try {
+    const undonePath = join(dirname(storePath), "golden.undone.jsonl");
+    if (existsSync(undonePath)) {
+      for (const l of readFileSync(undonePath, "utf8").split("\n")) {
+        const e = parseGoldenLine(l);
+        if (e) seq = Math.max(seq, e.seq + 1);
+      }
+    }
+  } catch { /* watermark is best-effort; the store itself already loaded */ }
+  return { entries: cur.entries, seq };
+}
+
 async function appendLine(storePath: string, line: string): Promise<void> {
   await withFileMutationQueue(storePath, async () => {
     await appendFile(storePath, line + "\n", "utf8");
@@ -196,7 +229,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     state.cwd = cwd;
     const storePath = resolveStorePath(state.cfg, state.cwd);
     ensureStoreDir(storePath);
-    const { entries, seq } = loadEntries(storePath);
+    const { entries, seq } = loadStoreWithWatermark(storePath);
     state.entries = entries;
     state.seq = seq;
     return true;
@@ -276,7 +309,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     state.cwd = cwd;
     const storePath = resolveStorePath(state.cfg, state.cwd);
     ensureStoreDir(storePath);
-    const { entries, seq } = loadEntries(storePath);
+    const { entries, seq } = loadStoreWithWatermark(storePath);
     state.entries = entries;
     state.seq = seq;
   });
@@ -370,8 +403,28 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   function buildWarmRequest(ctx: ExtensionContext): { system: string; messages: unknown[]; tools: unknown[] } | null {
     const cfg = state.cfg;
     const newRender = renderGoldenSection(state.entries, cfg); // includes the fresh checkpoint
-    const warmSystem = spliceGoldenSection(state.runSystemPrompt ?? "", state.runGoldenRender ?? "", newRender);
-    if (!warmSystem) return null; // byte-exactness not guaranteed -> skip (best-effort)
+    // PRIMARY base: the bytes the engine actually received last (wire capture). Swap the
+    // golden block in place — pi re-renders it from the same entries between the same tags,
+    // so swapped bytes = predicted bytes even after cap-overflow drops or undo shrink.
+    // A wire prompt without a golden block yet gets the block appended (pi's wrap form).
+    // FALLBACK base: pre-mutation runSystemPrompt via strict splice, then marker swap.
+    // Everything refusing -> null -> no warm request (best-effort, never guess).
+    const wireSys = state.wireSystem;
+    let warmSystem: string | null =
+      typeof wireSys === "string" && wireSys
+        ? replaceGoldenSection(wireSys, newRender)
+          ?? (wireSys.includes("<golden>") ? null : `${wireSys}\n\n<golden>\n${newRender}\n</golden>`)
+        : null;
+    if (!warmSystem) {
+      warmSystem = spliceGoldenSection(state.runSystemPrompt ?? "", state.runGoldenRender ?? "", newRender)
+        ?? replaceGoldenSection(state.runSystemPrompt ?? "", newRender);
+    }
+    if (!warmSystem) {
+      if (process.env.PI_GOLDEN_DEBUG) {
+        try { (ctx as { ui?: { notify?: (m: string, t?: string) => void } }).ui?.notify?.("golden prefill: skip: next bytes unproducible", "info"); } catch { /* no UI */ }
+      }
+      return null; // bytes not predictable -> skip
+    }
     // purge exactly what the next real request will purge — in the REAL pipeline order:
     // pi runs our `context` hook on the raw transcript roles and only THEN projects
     // custom roles (compactionSummary etc.) to user messages via convertToLlm. Folding
@@ -414,6 +467,54 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     } as never);
     await stream.result(); // one-token reply; we only wanted the prefill side effect
     dbg("warm prefill sent");
+  }
+
+  /** Warm now, or once, deferred 3s. Dedup: identical predicted bytes are never re-warmed.
+   *  The deferral exists because the settle checkpoint is fire-and-forget: by the time the
+   *  evidence await lands, a scripted/automated driver may have made the session busy again
+   *  (live replay proved the pre-fix version simply never fired). */
+  async function attemptWarm(ctx: ExtensionContext, req: { system: string; messages: unknown[]; tools: unknown[] }): Promise<void> {
+    if (!state.cfg.enabled || !state.cfg.prefillAfterCheckpoint) return;
+    const key = warmBytesKey(req);
+    if (key === state.lastWarmKey) return;
+    if (ctx.isIdle()) {
+      state.lastWarmKey = key;
+      await warmPrefill(ctx, req);
+      return;
+    }
+    if (process.env.PI_GOLDEN_DEBUG) { try { ctx.ui.notify("golden prefill: deferred (busy), retry in 3s", "info"); } catch { /* no UI */ } }
+    if (state.warmRetry) clearTimeout(state.warmRetry);
+    state.warmRetry = setTimeout(() => {
+      state.warmRetry = undefined;
+      if (!state.cfg.enabled || !state.cfg.prefillAfterCheckpoint) return;
+      if (!ctx.isIdle()) {
+        if (process.env.PI_GOLDEN_DEBUG) { try { ctx.ui.notify("golden prefill: skip: still busy", "info"); } catch { /* no UI */ } }
+        return;
+      }
+      state.lastWarmKey = warmBytesKey(req);
+      void warmPrefill(ctx, req).catch(() => { /* best-effort */ });
+    }, 3000);
+  }
+
+  function warmBytesKey(req: { system: string; messages: unknown[]; tools: unknown[] }): string {
+    const stringify = (v: unknown) => { try { return JSON.stringify(v) ?? ""; } catch { return String(v); } };
+    const s = req.system + "\u0000" + stringify(req.messages) + "\u0000" + stringify(req.tools);
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return `${s.length}:${h}`;
+  }
+
+  /**
+   * Widened policy (user, 2026-10-15): EVERY settle warms the predicted next-request bytes,
+   * whether or not a checkpoint folded. This is also how post-takeover compaction gets warmed:
+   * the settle of the compacted turn has nothing left to fold, and attemptWarm's byte-dedup
+   * keeps already-warmed bytes from being re-sent.
+   */
+  async function warmAtSettle(ctx: ExtensionContext): Promise<void> {
+    if (state.ckptInFlight) return;
+    const warmReq = buildWarmRequest(ctx);
+    if (!warmReq) return; // buildWarmRequest already traced the reason under PI_GOLDEN_DEBUG
+    await attemptWarm(ctx, warmReq);
   }
 
   /**
@@ -466,13 +567,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
           state.lastCkptStatus = `ckpt [${entry.seq}] · est ${formatTokens(Math.round(preChars / 4))}→${formatTokens(Math.round(postChars / 4))} tok`;
           state.lastCkptMeasured = false;
           ctx.ui.setStatus?.("golden", state.lastCkptStatus);
-          if (opts.prefill && cfg.prefillAfterCheckpoint) {
-            if (ctx.isIdle()) {
-              await warmPrefill(ctx, warmReq);
-            } else if (process.env.PI_GOLDEN_DEBUG) {
-              ctx.ui.notify("golden prefill: skip: session not idle", "info");
-            }
-          }
+          if (opts.prefill) await attemptWarm(ctx, warmReq);
         } else {
           state.lastCkptStatus = `ckpt [${entry.seq}] committed`;
           state.lastCkptMeasured = false;
@@ -493,7 +588,10 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   async function runCheckpoint(ctx: ExtensionContext): Promise<void> {
     if (!ctx.isIdle()) return; // pi is compacting/streaming — never start interleaved
     const messages = toLlmMessages(liveMessages(ctx));
-    await commitCheckpoint(ctx, messages, { prefill: true, requireCompletedTurn: true, force: false });
+    const entry = await commitCheckpoint(ctx, messages, { prefill: true, requireCompletedTurn: true, force: false });
+    // widened policy: a settle that folded NOTHING still warms (attemptWarm dedups identical
+    // bytes, so the folded case above — which already warmed — is not re-warmed here)
+    if (!entry) await warmAtSettle(ctx);
   }
 
   pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
@@ -601,9 +699,17 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     ctx.ui.setStatus?.("golden", state.lastCkptStatus);
   });
 
-  // request inspector (PI_GOLDEN_DUMP): observe, never mutate
+  // request inspector (PI_GOLDEN_DUMP): observe, never mutate. Also captures the WIRE ground
+  // truth (system bytes + tools of the last real agent request) for the warm prefill.
   pi.on("before_provider_request", (event) => {
     dumpRequest("agent", event.payload);
+    const p = event.payload as { messages?: { role?: string; content?: unknown }[]; tools?: unknown[] } | undefined;
+    const first = p?.messages?.[0];
+    if (first && (first.role === "system" || first.role === "developer")
+      && typeof first.content === "string" && first.content
+      && Array.isArray(p?.tools) && p.tools.length > 0) {
+      state.wireSystem = first.content;
+    }
   });
 
   pi.registerTool({
@@ -698,6 +804,48 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       report(ctx, "golden-eject",
         `would change ${plan.items.length} message(s): ${plan.ejected} result(s) ejected, ` +
         `${plan.reasoningStripped} reasoning block(s) stripped, ${plan.textFolded} text block(s) folded, ~${plan.bytesRemoved}B removed\n` + lines.join("\n"));
+    },
+  });
+
+  /**
+   * Hard-truncate undo (user-chosen over soft-retract, 2026-10-15): rewrite the store
+   * without its last N lines; the popped lines are ARCHIVED to golden.undone.jsonl
+   * (nothing is ever destroyed). Because ejection/coverage is recomputed from entries
+   * on every request, popping a checkpoint makes everything it purged reappear on the
+   * next wire — that is the actual "undo" the user sees. Seq never rewinds: a later
+   * commit cannot reuse an undone number (the archive references them).
+   */
+  pi.registerCommand("golden-undo", {
+    description: "Undo golden entries: /golden-undo [n] (default 1). Store is truncated; popped lines go to golden.undone.jsonl. Popping a checkpoint restores its purged content next request.",
+    handler: async (args, ctx) => {
+      if (!state.cfg.enabled) { ctx.ui.notify("golden-undo: extension disabled", "warning"); return; }
+      const n = parseUndoCount(args ?? "");
+      if (n === 0) { ctx.ui.notify("golden-undo: nothing to undo (n=0)", "info"); return; }
+      if (state.ckptInFlight || state.ckptPromise) {
+        ctx.ui.notify("golden-undo: a checkpoint is being committed — retry after it lands", "warning");
+        return;
+      }
+      const storePath = resolveStorePath(state.cfg, state.cwd);
+      if (!existsSync(storePath)) { ctx.ui.notify("golden-undo: nothing to undo (no store yet)", "info"); return; }
+      const undonePath = join(dirname(storePath), "golden.undone.jsonl");
+      let removed: GoldenEntry[] = [];
+      await withFileMutationQueue(storePath, async () => {
+        const cut = truncateStoreContent(readFileSync(storePath, "utf8"), n);
+        if (cut.removed.length === 0) return;
+        appendFileSync(undonePath, cut.removed.map((l) => `${l}\n`).join(""), "utf8");
+        writeFileSync(storePath, cut.keptText, "utf8");
+        removed = cut.removed.map(parseGoldenLine).filter((e): e is GoldenEntry => e !== null);
+      });
+      if (removed.length === 0) { ctx.ui.notify("golden-undo: nothing to undo (store empty)", "info"); return; }
+      const { entries, seq } = loadStoreWithWatermark(storePath);
+      state.entries = entries;
+      state.seq = Math.max(state.seq, seq); // monotonic across undos + restarts (archive watermark)
+      const what = removed.map((e) => `[${e.seq}] ${e.kind}`).join(", ");
+      const restoreNote = removed.some((e) => e.kind === "checkpoint")
+        ? " — purge coverage lifted; messages still in the live branch reappear next request"
+          + " (entries pi already sealed into a compaction stay sealed)"
+        : "";
+      report(ctx, "golden-undo", `Undid ${removed.length} entr${removed.length === 1 ? "y" : "ies"}: ${what}${restoreNote}\narchived to: ${undonePath}`);
     },
   });
 }

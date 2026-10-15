@@ -652,3 +652,60 @@ Existing global stores are not auto-migrated: the new code simply reads a differ
 an old `<agentDir>/golden-context/golden.jsonl` in place, un-read. Entries carry no cwd, so a
 mixed store cannot be split reliably after the fact — rename it (e.g.
 `golden.jsonl.pre-scope-global`) rather than deleting it if you want to keep the history.
+
+## 16. Gemma4 triage + undo/prefill decisions (2026-10-15)
+
+**Q: "does the model not work quite right with Gemma4-class models — is that even possible?"**
+
+- **Real loading path, resolved:** pi installs `git:` packages under
+  `~/.pi/agent/git/<host>/<owner>/<repo>` (not the `npm/` tree). On the reporter's machine the
+  installed `golden-{core,context}.ts` were byte-identical to the shipped commit, and per-directory
+  golden stores with real checkpoint content exist for several launch dirs — the §15 scoping is
+  observably live in everyday use.
+- **Gemma-class failures isolated to the engine side:** a session with a Gemma-architecture MoE
+  showed, in ~40 assistant turns, mostly healthy completions plus **2× "Stream ended without
+  finish_reason" and 1× "upstream command exited prematurely"**, with this plugin loaded and
+  checkpointing normally throughout. Both strings are transport-level: pi-ai's
+  `openai-completions.js:484` throws the first when an SSE completes with no `finish_reason`
+  chunk; the second is llama-swap reporting the backend process died/disconnected — and
+  llama-swap's own journal recorded repeated upstream-disconnection recoveries for that model in
+  the same time window. Extension hooks rewrite message bytes; they cannot close a stream — the
+  plugin is therefore not the **proximate** cause, though an indirect contribution (payload
+  shape/size provoking an engine fault) is not excluded; an A/B with `enabled:false` on the same
+  workload would settle it. Treat as an engine/transport robustness question for now.
+- **Config mismatch found en route:** the model entry declared `reasoning: false` while the engine
+  ran `--jinja --reasoning-preserve --reasoning-budget …` and emitted thinking on every reply.
+  Harmless for parsing — pi-ai's response-side `reasoning_content` handling is *ungated*
+  (`openai-completions.js:395-413`; the `model.reasoning` flag only gates request-side thinking
+  options) — but pi then records thinking without exposing thinking-level control. Recommended:
+  `reasoning: true` + a `thinkingLevelMap` on such entries. Provider config edits remain the
+  operator's call.
+
+**Decision — `/golden-undo` (hard truncate chosen over soft-retract):** rewrite the scoped store
+without its last N lines (default 1), archiving popped lines to `golden.undone.jsonl`; nothing is
+destroyed. Because ejection/coverage is recomputed from entries on every request, undoing a
+checkpoint **lifts its purge coverage** — content still in the live branch reappears on the next
+wire; messages pi already sealed via takeover compaction into a CompactionEntry stay sealed (undo
+is not a time machine for pi-side rewrites). `loadStoreWithWatermark` takes the seq high-water
+mark from the store AND the archive, so undone numbers are never reused, even after a restart
+(mutation-proven: reverting the watermark fails exactly the restart check). Accepted tradeoffs:
+the store is no longer strictly append-only, the turn after an undo re-prefills from the render
+cut point, and truncate-writes can race a **concurrent same-scope session** — single writer per
+scope dir assumed (`withFileMutationQueue` serializes only within one process). Guarded while a
+checkpoint is in flight.
+
+**Decision — prefill (two answers, same day):** the user first kept after-checkpoint-only and
+asked for reliability verification; live replay found the feature **inert** (offline stubs report
+`isIdle() === true` and had masked it: warm requests were built, none sent). Three root causes
+fixed, each with a test: prefill now rebuilds on the *observed wire* system prompt captured at
+`before_provider_request` (`event.systemPrompt` is the pre-mutation render, no golden block);
+`replaceGoldenSection` marker-swap keeps byte prediction alive when cap-overflow or undo breaks
+the strict-prefix proof; `attemptWarm` defers one 3s re-check instead of dropping on busy. The
+user then **widened the policy: every settle warms, folded or not** — byte-dedup makes the folded
+case a no-op re-entry, and the compacted turn's settle is exactly what covers post-takeover.
+**Live firing proven** at last: replay `plugin-ckpt` logged one `max_tokens=1` request after the
+takeover's agent turn (one, not more — dedup). `prefillAfterCheckpoint` keeps its key name, now
+meaning "warm on settle".
+
+Offline suite: **151 passed, 0 failed** (undo incl. a mutation-proven restart watermark check;
+marker-swap prediction; warm-on-nothing-folded + dedup; live replay confirms firing).

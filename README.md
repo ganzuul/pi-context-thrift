@@ -137,6 +137,7 @@ sandbox automatically.
 | `/golden-render` | the exact `<golden>` bytes the model sees right now |
 | `/golden-commit [kind] [spend:ids] <text>` | model-independent checkpoint/decision commit |
 | `/golden-eject` | dry-run: what would be ejected/stripped right now |
+| `/golden-undo [n]` | hard-truncate the store by the last N entries (default 1); popped lines are **archived** to `golden.undone.jsonl`, never deleted. Undoing a checkpoint lifts its purge coverage — messages still in the live branch reappear next request (entries pi already sealed into a compaction stay sealed). Seq numbers are never reused, even across restarts (the archive holds the high-water mark). Assumes **one pi writer per scope dir** — concurrent sessions in the same directory can race the truncate |
 
 ## Configuration
 
@@ -153,7 +154,7 @@ built-in defaults.
 | `summaryMaxTokens` / `summaryTargetTokens` | `512` / `128` | evidence call caps |
 | `callLineMaxChars` | `160` | tool-call line truncation inside checkpoints |
 | `hollowCoveredText` | `true` | fold covered text into handles (lossless) |
-| `prefillAfterCheckpoint` | `true` | warm-prefill the new prefix while idle |
+| `prefillAfterCheckpoint` | `true` | every idle settle warms the predicted next-request bytes with one `max_tokens=1` request — folded or unfolded (so post-takeover compaction is covered), based on the *observed wire* system prompt with the golden block swapped in; byte-dedup + one 3s deferred re-check (FINDINGS §16) |
 | `autoEjectOldToolResults` | `false` | additionally auto-prune old/large tool results (conservative) |
 | `tailKeepToolResults` | `4` | results kept in the tail when auto-ejecting |
 | `minResultBytesToEject` | `2048` | auto-eject size floor (text-only results) |
@@ -213,7 +214,7 @@ Design rationale, reproduction recipes, and every verified assumption:
 ## Development & tests
 
 ```sh
-node test/run.mjs          # offline suite — no GPU, no model, no pi startup (135 checks)
+node test/run.mjs          # offline suite — no GPU, no model, no pi startup (151 checks)
 ./test/scope-e2e.sh        # real pi, two directories, no GPU: proves per-directory golden
                            # negative control: SCOPE_OVERRIDE=global ./test/scope-e2e.sh must FAIL
 ./test/replay.sh [arm]     # drives REAL pi over RPC against a mock backend

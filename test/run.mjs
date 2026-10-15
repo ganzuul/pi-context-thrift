@@ -319,6 +319,33 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
     core.scopeKeyFor({ scope: "cwd" }, "/repo/sub", "/repo") === "--repo-sub--");
 }
 
+// ---- undo helpers (pure) ----
+{
+  const t = core.truncateStoreContent("a\nb\nc\n", 1);
+  check("truncateStoreContent drops exactly the last line", t.keptText === "a\nb\n" && t.removed.length === 1 && t.removed[0] === "c");
+  check("truncateStoreContent n>lines empties the file", core.truncateStoreContent("a\nb\n", 9).keptText === "");
+  const t0 = core.truncateStoreContent("a\nb\n", 0);
+  check("truncateStoreContent n=0 is a no-op", t0.keptText === "a\nb\n" && t0.removed.length === 0);
+  check("truncateStoreContent skips blank lines", core.truncateStoreContent("a\n\nb\n\n", 1).keptText === "a\n");
+  check("parseUndoCount: default/garbage/explicit", core.parseUndoCount("") === 1 && core.parseUndoCount("two") === 1
+    && core.parseUndoCount("3 x") === 3 && core.parseUndoCount("0") === 0);
+}
+
+// ---- marker-swap fallback (keeps prefill alive when splice's prefix proof dies) ----
+{
+  const runP = "HEAD\n\n<golden>\nPREAMBLE\n- [0] (record) dropped-by-cap\n- [1] (record) kept\n</golden>\nTAIL";
+  const swapped = core.replaceGoldenSection(runP, "PREAMBLE\n- [1] (record) kept\n- [2] (record) new");
+  check("replaceGoldenSection swaps between pi's own tags, byte-preserving outside",
+    swapped === "HEAD\n\n<golden>\nPREAMBLE\n- [1] (record) kept\n- [2] (record) new\n</golden>\nTAIL");
+  check("replaceGoldenSection works on SHRUNK renders (undo) where splice refuses",
+    core.spliceGoldenSection(runP, "PREAMBLE\n- [0] (record) dropped-by-cap\n- [1] (record) kept", "PREAMBLE\n- [1] (record) kept") === null
+    && (core.replaceGoldenSection(runP, "PREAMBLE\n- [1] (record) kept") ?? "").includes("- [1] (record) kept\n</golden>"));
+  check("replaceGoldenSection refuses without markers or with ambiguous ones",
+    core.replaceGoldenSection("no tags here", "x") === null
+    && core.replaceGoldenSection("a\n<golden>\n1\n</golden>\nb\n<golden>\n2\n</golden>", "x") === null
+    && core.replaceGoldenSection("a\n<golden>\n1\n</golden>\n", "") === null);
+}
+
 // Deterministic launch dir for the adapter tests: the store is scoped per directory, so this
 // fixture cwd decides where the adapter reads/writes golden.jsonl.
 const FIXTURE_CWD = "/golden-fixture-project";
@@ -337,7 +364,7 @@ const fakePi = {
 adapter.default ? adapter.default(fakePi) : adapter(fakePi);
 
 check("adapter registers commit_decision tool", !!registeredTools.commit_decision);
-check("adapter wires the 4 discrete commands", ["golden-status", "golden-render", "golden-commit", "golden-eject"].every((n) => typeof registeredCommands[n]?.handler === "function"));
+check("adapter wires the 5 discrete commands", ["golden-status", "golden-render", "golden-commit", "golden-eject", "golden-undo"].every((n) => typeof registeredCommands[n]?.handler === "function"));
 check("adapter wired session_start/before_agent_start/context", !!handlers.session_start && !!handlers.before_agent_start && !!handlers.context);
 
 // drive session_start (fresh store), commit via tool, then assert golden section + spend
@@ -479,12 +506,21 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   // gating: no tool calls in the covered range + policy with-tools -> silent skip
   await new Promise((r) => setTimeout(r, 150)); // let the background run fully finish (incl. prefill)
   const before = streamCalls.length;
-  handlers.agent_settled[0]({}, { ...ckCtx, sessionManager: { getBranch: () => [
+  const pureTextCtx = () => ({ ...ckCtx, sessionManager: { getBranch: () => [
+    { type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "bash", description: "d", parameters: {} }], timestamp: 1 } },
     { type: "message", message: { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 500 } },
     { type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "hello" }], timestamp: 501 } },
   ] } });
+  handlers.agent_settled[0]({}, pureTextCtx());
   await new Promise((r) => setTimeout(r, 60));
-  check("policy with-tools skips pure-text turns", streamCalls.length === before);
+  check("policy with-tools skips evidence calls on pure-text turns",
+    streamCalls.slice(before).every((c) => c.options.maxTokens !== 512));
+  check("widened policy: a settle that folds NOTHING still warms (max_tokens=1)",
+    streamCalls.slice(before).some((c) => c.options.maxTokens === 1));
+  const afterFirstWarm = streamCalls.length;
+  handlers.agent_settled[0]({}, pureTextCtx());
+  await new Promise((r) => setTimeout(r, 60));
+  check("dedup: identical next-request bytes are never re-warmed", streamCalls.length === afterFirstWarm);
 
   // serialization: session_before_compact waits for an in-flight checkpoint commit
   let slowResolve;
@@ -671,6 +707,51 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   await new Promise((r) => setTimeout(r, 60));
   check("in-flight fires when the MEASURED prompt is actually near-full",
     storeLines() === nStoreBeforeHot + 1 && hot?.messages?.some((m) => m.role === "toolResult" && String(m.content?.[0]?.text).startsWith("[golden]")) === true);
+
+  // ---- /golden-undo: hard truncate with archive; the seq never rewinds ----
+  {
+    const { readFileSync, existsSync } = require("node:fs");
+    const undonePath = join(dirname(storePath), "golden.undone.jsonl");
+    const before = readFileSync(storePath, "utf8").trim().split("\n");
+    const removedEntry = JSON.parse(before[before.length - 1]);
+    notices.length = 0;
+    await registeredCommands["golden-undo"].handler("", fakeCtx);
+    const after = readFileSync(storePath, "utf8").trim().split("\n");
+    check("/golden-undo removes exactly the last line", after.length === before.length - 1);
+    check("/golden-undo archives the removed entry", existsSync(undonePath)
+      && JSON.parse(readFileSync(undonePath, "utf8").trim().split("\n").pop()).seq === removedEntry.seq);
+    check("/golden-undo reports what it removed",
+      notices.some((n) => /Undid 1 entry/.test(n) && n.includes(`[${removedEntry.seq}]`)));
+
+    // RESTART SIMULATION: undo popped the store's highest seq; a fresh session_start
+    // reloads only from disk. Without consulting the undo archive for the high-water
+    // mark, the next commit would REUSE the popped seq (this check bites: pre-fix,
+    // loadEntries sees kept-max+1 === removedEntry.seq).
+    await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+    await registeredCommands["golden-commit"].handler("record after-restart marker", fakeCtx);
+    const newest = JSON.parse(readFileSync(storePath, "utf8").trim().split("\n").pop());
+    check("seq high-water survives a restart after undo (archive consulted)", newest.seq > removedEntry.seq);
+
+    // n=0 is refused politely and touches nothing
+    notices.length = 0;
+    const linesNow = readFileSync(storePath, "utf8").trim().split("\n").length;
+    await registeredCommands["golden-undo"].handler("0", fakeCtx);
+    check("/golden-undo 0 refuses politely, store untouched",
+      notices.some((n) => /nothing to undo/.test(n))
+      && readFileSync(storePath, "utf8").trim().split("\n").length === linesNow);
+
+    // live state must match the truncated store — undo reloads entries, it does not just
+    // rewrite bytes (otherwise the next render would still contain the undone line)
+    const statusNotices = [];
+    const statusCtx = {
+      ui: { notify: (m) => statusNotices.push(String(m)), setWidget: (_k, lines) => statusNotices.push(lines.join("\n")) },
+      getContextUsage: () => undefined,
+    };
+    await registeredCommands["golden-status"].handler("", statusCtx);
+    const storeNow = readFileSync(storePath, "utf8").trim().split("\n").length;
+    check("live entries reloaded to match the truncated store",
+      statusNotices.some((n) => n.includes(`(${storeNow} entries`)));
+  }
 
   // ---- SCOPE ISOLATION (the reported bug): another directory must start with a FRESH golden ----
   {
