@@ -267,10 +267,8 @@ export function coverageFromEntry(e: GoldenEntry, cfg: Pick<GoldenConfig, "hollo
   const throughTs = e.keepTs ?? e.coveredTs;
   if (throughTs === undefined) return undefined;
   return {
-    throughTs,
-    keepTextTs: e.keepTs,
     hollowText: cfg.hollowCoveredText,
-    foldLabel: `folded into checkpoint [${e.seq}]`,
+    bands: [{ fromTs: Number.NEGATIVE_INFINITY, throughTs, keepTextTs: e.keepTs, foldLabel: `folded into checkpoint [${e.seq}]` }],
   };
 }
 
@@ -296,17 +294,63 @@ export function formatEntryLine(e: GoldenEntry): string {
   return `- [${e.seq}] (${e.kind}) ${e.text}`;
 }
 
-export function renderGoldenSection(entries: GoldenEntry[], cfg: Pick<GoldenConfig, "maxGoldenSectionBytes">): string {
+/**
+ * The entries renderGoldenSection actually KEEPS: non-discard, minus the oldest lines pushed
+ * out by maxGoldenSectionBytes (at least one line always survives). SINGLE SOURCE OF TRUTH for
+ * "is this entry's text visible to the model" — the retention gate and /golden-status derive
+ * from it, so the purge can never claim credit for text the render dropped.
+ */
+export function selectRenderedEntries(entries: GoldenEntry[], cfg: Pick<GoldenConfig, "maxGoldenSectionBytes">): GoldenEntry[] {
   const promptEntries = entries.filter((e) => e.kind !== "discard");
-  if (promptEntries.length === 0) return "";
+  if (promptEntries.length === 0) return [];
   const lines = promptEntries.map(formatEntryLine);
-  while (Buffer.byteLength(lines.join("\n"), "utf8") > cfg.maxGoldenSectionBytes && lines.length > 1) {
-    lines.shift();
-  }
+  let drop = 0;
+  while (Buffer.byteLength(lines.slice(drop).join("\n"), "utf8") > cfg.maxGoldenSectionBytes && lines.length - drop > 1) drop += 1;
+  return promptEntries.slice(drop);
+}
+
+export function renderGoldenSection(entries: GoldenEntry[], cfg: Pick<GoldenConfig, "maxGoldenSectionBytes">): string {
+  const rendered = selectRenderedEntries(entries, cfg);
+  if (rendered.length === 0) return "";
   const preamble =
     "Durable decisions extracted from earlier turns; authoritative for what is already decided. " +
     "Do not re-derive or restate them. The working set is the live message tail.\n";
-  return preamble + lines.join("\n");
+  return preamble + rendered.map(formatEntryLine).join("\n");
+}
+
+/**
+ * Purge coverage gated on render visibility (findings §17). Each RENDERED checkpoint owns the
+ * range it recorded — (previous checkpoint's frontier, its own coveredTs] — and only that range
+ * becomes hollowable. When the byte cap drops the oldest checkpoints, the ranges they recorded
+ * fall outside every band: that text stays verbatim in the tail instead of being hollowed while
+ * invisible everywhere. No rendered checkpoint ⇒ no coverage at all.
+ * Bands derive from selectRenderedEntries — one cap policy, two consumers, no drift.
+ */
+export function gatedCoverage(
+  entries: GoldenEntry[],
+  cfg: Pick<GoldenConfig, "hollowCoveredText" | "maxGoldenSectionBytes">,
+): CheckpointCoverage | undefined {
+  const rendered = new Set(selectRenderedEntries(entries, cfg).map((e) => e.seq));
+  const bands: CoverageBand[] = [];
+  let floor = Number.NEGATIVE_INFINITY; // previous checkpoint's frontier, rendered or not
+  let lastCp: GoldenEntry | undefined;
+  for (const e of entries) {
+    if (e.kind !== "checkpoint") continue;
+    const frontier = e.keepTs ?? e.coveredTs;
+    if (frontier === undefined) continue;
+    lastCp = e;
+    const throughTs = e.coveredTs ?? frontier; // the kept reply normally falls in the NEXT band
+    if (rendered.has(e.seq)) bands.push({ fromTs: floor, throughTs, foldLabel: `folded into checkpoint [${e.seq}]` });
+    floor = throughTs;
+  }
+  if (bands.length === 0) return undefined;
+  // §12: the newest checkpoint's LIVE reply stays verbatim at the tail bottom but its thinking
+  // is purged — so extend its band to keepTs with a text-only exemption on that message.
+  if (lastCp && rendered.has(lastCp.seq) && lastCp.keepTs !== undefined) {
+    const tip = bands[bands.length - 1];
+    if (lastCp.keepTs > tip.throughTs) { tip.throughTs = lastCp.keepTs; tip.keepTextTs = lastCp.keepTs; }
+  }
+  return { hollowText: cfg.hollowCoveredText, bands };
 }
 
 /** Set of toolCallIds declared spent across all golden entries. */
@@ -407,6 +451,9 @@ export interface StatusData {
   cfg: GoldenConfig;
   ckptLine?: string | undefined;
   usageLine?: string | undefined;
+  /** render visibility under the byte cap (retention gate): kept vs non-discard total. */
+  renderKept?: number;
+  renderTotal?: number;
 }
 
 /** Pure text report for `/golden-status`. */
@@ -418,6 +465,9 @@ export function formatStatus(d: StatusData): string {
   lines.push(`ejection: tailKeepToolResults=${d.cfg.tailKeepToolResults} autoEject=${d.cfg.autoEjectOldToolResults} ` +
     `minResultBytes=${d.cfg.minResultBytesToEject} stripThinkingOnSpend=${d.cfg.stripThinkingOnSpend}`);
   lines.push(`golden section cap: ${d.cfg.maxGoldenSectionBytes}B`);
+  if (d.renderTotal !== undefined && d.renderKept !== undefined && d.renderKept < d.renderTotal) {
+    lines.push(`render: newest ${d.renderKept}/${d.renderTotal} lines fit the cap; ${d.renderTotal - d.renderKept} dropped — their recorded text stays verbatim in the tail (retention gate)`);
+  }
   lines.push(`spent toolCallIds: ${d.spentIds.length}${d.spentIds.length ? " (" + d.spentIds.map((s) => s.slice(0, 8)).join(", ") + ")" : ""}`);
   if (d.lastEntry) {
     const t = d.lastEntry.text.length > 100 ? d.lastEntry.text.slice(0, 100) + "…" : d.lastEntry.text;
@@ -478,12 +528,24 @@ export interface EjectionResult {
  * final reply to the user, which stays verbatim at the tail bottom until the NEXT
  * checkpoint folds it.
  */
-export interface CheckpointCoverage {
+export interface CoverageBand {
+  /** exclusive lower bound: the recorded frontier of the checkpoint just before this one
+   *  (NEGATIVE_INFINITY for the first checkpoint). */
+  fromTs: number;
+  /** inclusive upper bound: this checkpoint's purge frontier (coveredTs; keepTs when the
+   *  entry has none). The reply it kept sits above the bound and stays verbatim. */
   throughTs: number;
+  /** legacy single-entry coverage: message ts that must survive despite being <= throughTs. */
   keepTextTs?: number | undefined;
-  hollowText: boolean;
-  /** handle text for folded messages, e.g. "folded into checkpoint [7]". */
   foldLabel: string;
+}
+export interface CheckpointCoverage {
+  hollowText: boolean;
+  /** RETENTION GATE (findings §17): purge ranges whose recording checkpoint is CURRENTLY
+   *  RENDERED into the golden section. A message may be hollowed/collapsed only inside a
+   *  band — text the byte cap dropped from the render is text the purge must leave verbatim
+   *  in the tail, or it exists nowhere the model can see. Sorted oldest→newest. */
+  bands: CoverageBand[];
 }
 
 /**
@@ -526,22 +588,24 @@ export function applyEjection(
   }
 
   // effective timestamps (carry forward over messages missing one) decide coverage.
-  const covered: boolean[] = [];
+  // RETENTION GATE: a message is covered iff it falls inside a band — i.e. the checkpoint
+  // that recorded its text is currently rendered. Dropped-entry ranges stay verbatim (§17).
+  const coveredBand: (CoverageBand | undefined)[] = [];
   let carryTs = 0;
   for (const msg of messages) {
     const ts = typeof msg.timestamp === "number" ? msg.timestamp : carryTs;
     if (typeof msg.timestamp === "number") carryTs = ts;
-    covered.push(coverage !== undefined && ts <= coverage.throughTs);
+    coveredBand.push(coverage?.bands.find((b) => ts > b.fromTs && ts <= b.throughTs));
   }
-  const isKeep = (i: number): boolean => {
-    if (coverage?.keepTextTs === undefined) return false;
-    const ts = messages[i].timestamp;
-    return typeof ts === "number" && ts === coverage.keepTextTs;
-  };
+  // §12 semantics: the live reply (band.keepTextTs) keeps its TEXT verbatim, but its
+  // reasoning is still purged — so keepTextTs exempts folding only, never coverage.
+  const isKeepText = (msg: AnyMessage, band: CoverageBand | undefined): boolean =>
+    band?.keepTextTs !== undefined && msg.timestamp === band.keepTextTs;
 
   let ejected = 0, reasoningStripped = 0, bytesRemoved = 0, textFolded = 0, changed = false;
   const out: AnyMessage[] = messages.map((msg, i) => {
-    const isCovered = covered[i];
+    const band = coveredBand[i];
+    const isCovered = band !== undefined;
 
     if (msg.role === "toolResult") {
       const m = msg as unknown as ToolResultLike;
@@ -573,28 +637,28 @@ export function applyEjection(
         }
       }
 
-      // fold covered text into a checkpoint handle (the reply at keepTextTs stays verbatim)
-      if (coverage?.hollowText && cfg.hollowCoveredText && isCovered && !isKeep(i)) {
+      // fold covered text into a checkpoint handle (the kept live reply stays verbatim)
+      if (coverage?.hollowText && cfg.hollowCoveredText && band !== undefined && !isKeepText(m, band)) {
         const texts = outBlocks.filter((b) => b && b.type === "text") as TextContent[];
         if (texts.length > 0) {
           const keep = outBlocks.filter((b) => !(b && b.type === "text"));
           bytesRemoved += textBytes(m);
           changed = true; textFolded += 1;
-          outBlocks = [{ type: "text", text: `[golden] assistant text ${coverage.foldLabel}` }, ...keep];
+          outBlocks = [{ type: "text", text: `[golden] assistant text ${band.foldLabel}` }, ...keep];
         }
       }
 
       return outBlocks === blocks ? msg : { ...m, content: outBlocks };
     }
 
-    if (msg.role === "user" && coverage?.hollowText && cfg.hollowCoveredText && isCovered && !isKeep(i)) {
+    if (msg.role === "user" && coverage?.hollowText && cfg.hollowCoveredText && band !== undefined && !isKeepText(msg, band)) {
       const arr = Array.isArray(msg.content) ? (msg.content as Content[]) : [];
       const texts = arr.filter((c) => c && c.type === "text") as TextContent[];
       if (texts.length > 0) {
         const keep = arr.filter((c) => !(c && c.type === "text"));
         bytesRemoved += textBytes(msg);
         changed = true; textFolded += 1;
-        return { ...msg, content: [{ type: "text", text: `[golden] user text ${coverage.foldLabel}` }, ...keep] };
+        return { ...msg, content: [{ type: "text", text: `[golden] user text ${band.foldLabel}` }, ...keep] };
       }
     }
 

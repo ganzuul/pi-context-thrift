@@ -133,11 +133,11 @@ sandbox automatically.
 
 | command | what it does |
 |---|---|
-| `/golden-status` | store state, config, spent ids, context usage line |
+| `/golden-status` | store state, config, spent ids, context usage line, render-cap pressure |
 | `/golden-render` | the exact `<golden>` bytes the model sees right now |
 | `/golden-commit [kind] [spend:ids] <text>` | model-independent checkpoint/decision commit |
 | `/golden-eject` | dry-run: what would be ejected/stripped right now |
-| `/golden-undo [n]` | hard-truncate the store by the last N entries (default 1); popped lines are **archived** to `golden.undone.jsonl`, never deleted. Undoing a checkpoint lifts its purge coverage — messages still in the live branch reappear next request (entries pi already sealed into a compaction stay sealed). Seq numbers are never reused, even across restarts (the archive holds the high-water mark). Assumes **one pi writer per scope dir** — concurrent sessions in the same directory can race the truncate |
+| `/golden-undo [n]` | hard-truncate the store by the last N entries (default 1); popped lines are **archived** to `golden.undone.jsonl`, never deleted. Undoing a checkpoint lifts its purge coverage — messages still in the live branch reappear next request (entries pi already sealed into a compaction stay sealed). Seq numbers are never reused, even across restarts (the archive holds the high-water mark). Assumes **one pi writer per scope dir** — concurrent sessions in the same directory can race the truncate. The confirmation is a transient notification, never a persistent panel |
 
 ## Configuration
 
@@ -163,6 +163,13 @@ built-in defaults.
 | `scope` | `cwd` | store scoping: `cwd` (one store per launch directory), `git` (one per repo, `cwd` fallback), or `global` (single machine-wide store — the behavior before store scoping existed) |
 | `goldenStoreRel` | `golden-context/golden.jsonl` | store path relative to the agent dir; the `scope` key is inserted as a directory segment |
 | `handleTemplate` | see config | the eject-handle text |
+
+**Retention gate (FINDINGS §17):** the purge folds or collapses a message only inside a band whose
+recording checkpoint is currently rendered into `<golden>`. When `maxGoldenSectionBytes` pushes
+oldest entries off the render, their originals stay verbatim in the tail (never invisible in both
+places at once), spends recorded by dropped entries stop ejecting, and `/golden-status` surfaces
+the cap pressure. Invariant: this plugin never mutates session storage — all folding is wire-only,
+so pi's `/export` keeps recording the full vanilla transcript by construction.
 
 ## Environment variables
 
@@ -214,7 +221,7 @@ Design rationale, reproduction recipes, and every verified assumption:
 ## Development & tests
 
 ```sh
-node test/run.mjs          # offline suite — no GPU, no model, no pi startup (151 checks)
+node test/run.mjs          # offline suite — no GPU, no model, no pi startup (165 checks)
 ./test/scope-e2e.sh        # real pi, two directories, no GPU: proves per-directory golden
                            # negative control: SCOPE_OVERRIDE=global ./test/scope-e2e.sh must FAIL
 ./test/replay.sh [arm]     # drives REAL pi over RPC against a mock backend

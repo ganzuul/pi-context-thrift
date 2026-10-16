@@ -692,7 +692,11 @@ mark from the store AND the archive, so undone numbers are never reused, even af
 the store is no longer strictly append-only, the turn after an undo re-prefills from the render
 cut point, and truncate-writes can race a **concurrent same-scope session** — single writer per
 scope dir assumed (`withFileMutationQueue` serializes only within one process). Guarded while a
-checkpoint is in flight.
+checkpoint is in flight. *2026-10-16 follow-up:* first TUI use reported the undo confirmation
+**lingering in the chat window** — the success path had gone through `report()`, which pins the
+persistent `golden-report` widget (by design for long reports only); switched to a transient
+`ctx.ui.notify(...)`, the same surface `/golden-commit`'s success uses, with a regression check
+asserting undo leaves no widget.
 
 **Decision — prefill (two answers, same day):** the user first kept after-checkpoint-only and
 asked for reliability verification; live replay found the feature **inert** (offline stubs report
@@ -707,5 +711,47 @@ case a no-op re-entry, and the compacted turn's settle is exactly what covers po
 takeover's agent turn (one, not more — dedup). `prefillAfterCheckpoint` keeps its key name, now
 meaning "warm on settle".
 
-Offline suite: **151 passed, 0 failed** (undo incl. a mutation-proven restart watermark check;
-marker-swap prediction; warm-on-nothing-folded + dedup; live replay confirms firing).
+Offline suite: **152 passed, 0 failed** (undo incl. a mutation-proven restart watermark check and
+a no-persistent-panel regression check; marker-swap prediction; warm-on-nothing-folded + dedup;
+live replay confirms firing).
+
+## 17. Retention gate (2026-10-16) — the purge may only claim what the render carries
+
+**The hole:** purge coverage was a single cumulative frontier (newest checkpoint's `throughTs`),
+hollowing every older message — while `renderGoldenSection` drops the OLDEST lines past
+`maxGoldenSectionBytes`, and the checkpoint floor records each message's text in exactly ONE
+entry. Once the cap ate a checkpoint, the messages it recorded were hollowed from the tail *and*
+absent from golden: visible nowhere. Observed on two real operator stores: the first rendered only
+its newest of 8 checkpoints (14/14 `[user]` lines lost); the second dropped 4 of 8 (3/8 lost).
+Fold handles also pointed at the newest checkpoint regardless of which entry recorded the text —
+misdirection in the prompt itself.
+
+**The fix — banded, render-derived purge:**
+- `selectRenderedEntries(entries, cfg)` — the cap loop extracted verbatim; single source of truth
+  for "rendered", shared by renderer, gate, and `/golden-status` (drift impossible by construction).
+- `CheckpointCoverage` is now `{ hollowText, bands }` — one band per RENDERED checkpoint over the
+  range it recorded, `(previousCheckpoint.coveredTs, own.coveredTs]`; the floor advances past
+  dropped checkpoints, so a dropped range is inside NO band. `gatedCoverage` returns `undefined`
+  when nothing renders. The final band extends to the newest checkpoint's `keepTs` with a
+  `keepTextTs` exemption that applies to TEXT folding only — so the §12 semantic (live reply's
+  thinking purged, its text verbatim) survives exactly.
+- Fold labels now name the checkpoint that actually carries the text.
+- Spend lists are gated to rendered entries too: a spend recorded by a dropped entry no longer
+  keeps its tool result ejected (the justification text is invisible — same invariant).
+
+**Costs, stated:** dropped-range text re-inflates the wire (the honesty trade), advancing takeover
+compaction pressure — takeover sizing is KV-anchored (§14), so no checkpoint loop; and the turn on
+which an entry crosses the cap pays one re-prefill (the cap already busts the prefix by design; the
+gate inherits that cost, never adds a new class). `/golden-status` now prints
+`render: newest K/T lines fit the cap; N dropped — ... (retention gate)` — silent drops are gone.
+
+**Verification:** offline **165 passed, 0 failed** (13 new checks incl. gated==legacy when nothing
+drops). Mutation-proven: replacing `selectRenderedEntries` with "all entries" inside the gate makes
+exactly the 6 gate-behavior checks fail; restore byte-identical. Live acceptance: the real
+`gatedCoverage` over the two polluted stores now protects 18/22 and 3/8 `[user]` lines respectively
+(outside every band ⇒ verbatim). Export parity: `replay.sh` decodes pi's base64 export payload and
+asserts payload==storage entry counts and zero fold-label leakage — green in all four arms
+(pi-only/plugin/plugin-eject/plugin-ckpt).
+
+**Invariant (policy):** golden-context never mutates session storage; all folding is wire-only;
+`/export` parity is structural, not emergent. Any future size fix must stay wire-side.

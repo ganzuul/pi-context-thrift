@@ -218,7 +218,9 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
   const rt = core.parseGoldenLine(core.entryToJsonLine(e));
   check("checkpoint entry round-trips coveredTs/keepTs", rt?.coveredTs === 102 && rt?.keepTs === 103 && rt?.kind === "checkpoint");
   const cov = rt ? core.coverageFromEntry(rt, core.parseConfig({})) : undefined;
-  check("coverageFromEntry: throughTs = keepTs (purge incl. reply thinking)", cov?.throughTs === 103 && cov?.keepTextTs === 103);
+  check("coverageFromEntry: band = legacy frontier (throughTs = keepTs, keep exempted)",
+    cov?.bands?.[0]?.throughTs === 103 && cov?.bands?.[0]?.keepTextTs === 103
+    && cov?.bands?.[0]?.fromTs === Number.NEGATIVE_INFINITY);
   check("coverageFromEntry: non-checkpoint entries yield none", core.coverageFromEntry(e1, core.parseConfig({})) === undefined);
 
   // checkpoint lines render in golden and keep the strict-prefix invariant
@@ -274,7 +276,7 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
       { type: "text", text: "Build succeeded." } ], timestamp: 103 },
     { role: "user", content: [{ type: "text", text: "thanks" }], timestamp: 200 },
   ];
-  const coverage = { throughTs: 103, keepTextTs: 103, hollowText: true, foldLabel: "folded into checkpoint [0]" };
+  const coverage = { hollowText: true, bands: [{ fromTs: Number.NEGATIVE_INFINITY, throughTs: 103, keepTextTs: 103, foldLabel: "folded into checkpoint [0]" }] };
   const r = core.applyEjection(msgsC, cfgC, new Set(), coverage);
   check("coverage purges covered toolResult DESPITE tail protection", r.ejected === 1 && r.messages[2].content[0].text.startsWith("[golden]"));
   check("coverage strips ALL covered thinking (incl. keep reply)", r.reasoningStripped === 2 &&
@@ -329,6 +331,46 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
   check("truncateStoreContent skips blank lines", core.truncateStoreContent("a\n\nb\n\n", 1).keptText === "a\n");
   check("parseUndoCount: default/garbage/explicit", core.parseUndoCount("") === 1 && core.parseUndoCount("two") === 1
     && core.parseUndoCount("3 x") === 3 && core.parseUndoCount("0") === 0);
+}
+
+// ---- retention gate: purge may only claim text the render actually carries (findings §17) ----
+{
+  const pad = "x".repeat(300);
+  const ck0 = { seq: 0, ts: 1, kind: "checkpoint", text: `[user] ancient dropped ask ${pad}`, spend: ["idA"], coveredTs: 100, keepTs: 101 };
+  const ck1 = { seq: 1, ts: 2, kind: "checkpoint", text: "recent rendered checkpoint", spend: ["idB"], coveredTs: 200, keepTs: 201 };
+  const gcfg = core.parseConfig({ maxGoldenSectionBytes: 370, tailKeepToolResults: 0 });
+
+  check("selectRenderedEntries keeps the newest suffix under cap",
+    core.selectRenderedEntries([ck0, ck1], gcfg).length === 1);
+  check("selectRenderedEntries skips discards + always keeps >=1 line",
+    core.selectRenderedEntries([ck0, { ...ck1, kind: "discard" }], core.parseConfig({})).every((e) => e.kind !== "discard")
+    && core.selectRenderedEntries([ck0], core.parseConfig({ maxGoldenSectionBytes: 1 })).length === 1);
+
+  const gcov = core.gatedCoverage([ck0, ck1], gcfg);
+  check("gatedCoverage: dropped checkpoint leaves NO band; rendered band starts at its frontier",
+    !!gcov && gcov.bands.length === 1 && gcov.bands[0].fromTs === 100 && gcov.bands[0].throughTs === 201
+    && gcov.bands[0].keepTextTs === 201 && gcov.bands[0].foldLabel === "folded into checkpoint [1]");
+  const rec = { seq: 2, ts: 3, kind: "record", text: "small", spend: [] };
+  check("gatedCoverage: no rendered checkpoint -> no coverage at all",
+    core.gatedCoverage([{ ...ck0, text: "z".repeat(400) }, { ...ck1, text: "z".repeat(400) }, rec],
+      core.parseConfig({ maxGoldenSectionBytes: 40 })) === undefined);
+
+  const gmsgs = [
+    { role: "user", content: [{ type: "text", text: "ANCIENT-ASK" }], timestamp: 50 },
+    { role: "toolResult", toolCallId: "idA", toolName: "bash", isError: false, timestamp: 60, content: [{ type: "text", text: "A".repeat(100) }] },
+    { role: "user", content: [{ type: "text", text: "RECENT-ASK" }], timestamp: 150 },
+    { role: "toolResult", toolCallId: "idB", toolName: "bash", isError: false, timestamp: 160, content: [{ type: "text", text: "B".repeat(100) }] },
+  ];
+  const gres = core.applyEjection(gmsgs, gcfg, new Set(["idB"]), gcov); // refresh() filters idA out (adapter-gated)
+  check("retention gate: dropped-range user text stays VERBATIM", gres.messages[0] === gmsgs[0]);
+  check("retention gate: dropped-range result NOT ejected (not covered, spend gated upstream)", gres.messages[1] === gmsgs[1]);
+  check("retention gate: in-band user text folds with the RECORDING checkpoint's label",
+    String(gres.messages[2]?.content?.[0]?.text ?? "").startsWith("[golden] user text folded into checkpoint [1]"));
+  check("retention gate: in-band covered result collapses even with tailKeep=0",
+    gres.messages[3] !== gmsgs[3] && gres.messages[3].content[0].text.startsWith("[golden]"));
+  check("gated == legacy when nothing is dropped (prefix behavior preserved)",
+    JSON.stringify(core.applyEjection(gmsgs, core.parseConfig({ tailKeepToolResults: 0 }), new Set(["idA", "idB"]),
+      core.gatedCoverage([ck0, ck1], core.parseConfig({ tailKeepToolResults: 0 }))).ejected) === "2");
 }
 
 // ---- marker-swap fallback (keeps prefill alive when splice's prefix proof dies) ----
@@ -715,7 +757,11 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
     const before = readFileSync(storePath, "utf8").trim().split("\n");
     const removedEntry = JSON.parse(before[before.length - 1]);
     notices.length = 0;
+    const widgetsBefore = widgets.length;
     await registeredCommands["golden-undo"].handler("", fakeCtx);
+    check("/golden-undo leaves NO persistent panel (transient notify only)",
+      widgets.length === widgetsBefore
+      && !widgets.slice(widgetsBefore).some((w) => w.key === "golden-report"));
     const after = readFileSync(storePath, "utf8").trim().split("\n");
     check("/golden-undo removes exactly the last line", after.length === before.length - 1);
     check("/golden-undo archives the removed entry", existsSync(undonePath)
@@ -784,6 +830,41 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
     handlers.before_agent_start[0](evBack, { cwd: FIXTURE_CWD });
     check("returning to the original directory restores ITS golden",
       String(evBack.systemPromptOptions.sections.golden ?? "").includes("lower ctx to free VRAM"));
+  }
+
+  // ---- retention gate END-TO-END through the real `context` hook + status surfacing ----
+  {
+    const { writeFileSync } = require("node:fs");
+    writeFileSync(join(AGENT, "golden-context", "config.json"), JSON.stringify({
+      maxGoldenSectionBytes: 370, tailKeepToolResults: 0, autoCheckpoint: false,
+    }));
+    writeFileSync(STORE, [
+      core.entryToJsonLine({ seq: 0, ts: 1, kind: "checkpoint", text: `[user] DROP-ME-OUT ${"d".repeat(320)}`, spend: ["gA"], coveredTs: 100, keepTs: 101 }),
+      core.entryToJsonLine({ seq: 1, ts: 2, kind: "checkpoint", text: "KEPT-BAND checkpoint", spend: ["gB"], coveredTs: 200, keepTs: 201 }),
+    ].join("\n") + "\n");
+    await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+
+    const ancient = { role: "user", content: [{ type: "text", text: "ANCIENT-OUTSIDE-BAND" }], timestamp: 50 };
+    const bigResult = { role: "toolResult", toolCallId: "gA", toolName: "bash", isError: false, timestamp: 60, content: [{ type: "text", text: "x".repeat(5000) }] };
+    const recent = { role: "user", content: [{ type: "text", text: "RECENT-INSIDE-BAND" }], timestamp: 150 };
+    const hookCtx = { cwd: FIXTURE_CWD, isIdle: () => true,
+      ui: { notify() {}, setStatus() {}, setWidget() {} },
+      sessionManager: { getBranch: () => [] }, getContextUsage: () => undefined };
+    const ev = { messages: [ancient, bigResult, recent] };
+    const out = await handlers.context[0](ev, hookCtx);
+    const msgs = out?.messages ?? ev.messages;
+    check("hook gate: out-of-band user message passes through untouched", msgs[0] === ancient);
+    check("hook gate: out-of-band 5KB spent result NOT collapsed (was the §15 amnesia)", msgs[1] === bigResult);
+    check("hook gate: in-band user message folded, label names the RENDERED checkpoint",
+      String(msgs[2]?.content?.[0]?.text ?? "").startsWith("[golden] user text folded into checkpoint [1]"));
+
+    const statusLines = [];
+    await registeredCommands["golden-status"].handler("", {
+      ui: { notify: (m) => statusLines.push(String(m)), setWidget: (_k, l) => statusLines.push((l ?? []).join("\n")) },
+      getContextUsage: () => undefined,
+    });
+    check("golden-status surfaces cap pressure instead of dropping silently",
+      statusLines.some((x) => /render:.*1\/2.*dropped.*retention gate/.test(x)));
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

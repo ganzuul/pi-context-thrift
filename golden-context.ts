@@ -40,7 +40,6 @@ import {
   buildEvidencePrompt,
   collectCheckpoint,
   collectSpentIds,
-  coverageFromEntry,
   describeEjection,
   EVIDENCE_SYSTEM_PROMPT,
   entryToJsonLine,
@@ -49,6 +48,7 @@ import {
   findGitRoot,
   formatStatus,
   formatTokens,
+  gatedCoverage,
   parseCommitArgs,
   parseConfig,
   parseGoldenLine,
@@ -57,6 +57,7 @@ import {
   replaceGoldenSection,
   resolveToolLoadout,
   scopeKeyFor,
+  selectRenderedEntries,
   spliceGoldenSection,
   toLlmMessages,
   truncateStoreContent,
@@ -217,7 +218,9 @@ function dumpRequest(source: "agent" | "evidence" | "prefill", payload: unknown)
 export default function goldenContextExtension(pi: ExtensionAPI): void {
   const state: LiveState = { cfg: loadConfig(), entries: [], seq: 0, cwd: process.cwd(), ckptInFlight: false };
 
-  const refresh = (): Set<string> => collectSpentIds(state.entries);
+  /** Spent ids that the RENDERED golden can still justify: a spend recorded by an entry the
+   *  byte cap dropped must not keep that tool result ejected (retention gate, findings §17). */
+  const refresh = (): Set<string> => collectSpentIds(selectRenderedEntries(state.entries, state.cfg));
 
   /**
    * Adopt a launch dir: point the live store at that scope and load its own entries.
@@ -262,14 +265,10 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     return Number.NEGATIVE_INFINITY;
   }
 
-  /** Purge coverage of the newest checkpoint entry — what the `context` hook applies per request. */
+  /** Purge coverage for the `context` hook, RETENTION-GATED: bands only for checkpoints the
+   *  render currently keeps. Dropped checkpoints' ranges stay verbatim in the tail (§17). */
   function currentCoverage(): CheckpointCoverage | undefined {
-    for (let i = state.entries.length - 1; i >= 0; i--) {
-      const e = state.entries[i];
-      const cov = coverageFromEntry(e, state.cfg);
-      if (cov) return cov;
-    }
-    return undefined;
+    return gatedCoverage(state.entries, state.cfg);
   }
 
   /**
@@ -743,6 +742,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       const storePath = resolveStorePath(state.cfg, state.cwd);
       const usage = ctx.getContextUsage();
+      const rendered = selectRenderedEntries(state.entries, state.cfg);
       report(ctx, "golden-status", formatStatus({
         enabled: state.cfg.enabled,
         storePath,
@@ -752,6 +752,8 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
         lastEntry: state.entries[state.entries.length - 1],
         cfg: state.cfg,
         ckptLine: state.lastCkptStatus,
+        renderKept: rendered.length,
+        renderTotal: state.entries.filter((e) => e.kind !== "discard").length,
         usageLine: usage
           ? `${usage.tokens ?? "?"}/${usage.contextWindow} (${usage.percent !== null && usage.percent !== undefined ? usage.percent.toFixed(1) + "%" : "n/a"})`
           : undefined,
@@ -845,7 +847,10 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
         ? " — purge coverage lifted; messages still in the live branch reappear next request"
           + " (entries pi already sealed into a compaction stay sealed)"
         : "";
-      report(ctx, "golden-undo", `Undid ${removed.length} entr${removed.length === 1 ? "y" : "ies"}: ${what}${restoreNote}\narchived to: ${undonePath}`);
+      // Transient notify, NOT report(): report() pins its text into the persistent
+      // "golden-report" panel (intended for long reports like /golden-render; nothing clears
+      // it until the next report). A one-shot confirmation belongs beside /golden-commit's.
+      ctx.ui.notify(`golden-undo: Undid ${removed.length} entr${removed.length === 1 ? "y" : "ies"}: ${what}${restoreNote} — archived to ${undonePath}`, "info");
     },
   });
 }

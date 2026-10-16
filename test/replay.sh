@@ -133,6 +133,37 @@ JSON
 
   kill $srv 2>/dev/null || true
   trap - RETURN
+
+  # ---- EXPORT PARITY (findings §17 invariant) ----
+  # /export embeds SESSION STORAGE as a base64 JSON blob (pi renders it client-side), so raw
+  # grep never sees transcript text. Decode and assert two STRUCTURAL properties (no fixture
+  # content is hardcoded here — users supply their own session file): (1) the payload carries
+  # every message/compaction entry the storage file has, (2) wire-only fold labels never leaked
+  # into storage. Fold labels exist only on the wire; finding one in the payload means a purge
+  # mutated storage, breaking the invariant.
+  if [ -f "$out/replay-export.html" ] && [ -f "$out/session.jsonl" ]; then
+    PARITY=$(python3 - "$out/replay-export.html" "$out/session.jsonl" <<'PY'
+import re, base64, json, sys
+h = open(sys.argv[1], encoding="utf8", errors="replace").read()
+m = re.search(r'([A-Za-z0-9+/=]{2000,})', h)
+if not m:
+    print("[parity] FAIL: no embedded session payload"); raise SystemExit
+j = json.loads(base64.b64decode(m.group(1)).decode("utf8", "replace"))
+file_n = 0
+for line in open(sys.argv[2], encoding="utf8", errors="replace"):
+    line = line.strip()
+    if line and json.loads(line).get("type") in ("message", "compaction"):
+        file_n += 1
+payload_n = sum(1 for e in j.get("entries", []) if e.get("type") in ("message", "compaction"))
+leaked = "folded into checkpoint" in json.dumps(j)
+if payload_n >= file_n and not leaked:
+    print(f"[parity] export=vanilla: all {payload_n} storage entries present, zero wire fold-labels")
+else:
+    print(f"[parity] FAIL: payload={payload_n} file={file_n} fold-labels-leaked={leaked}")
+PY
+) || PARITY="[parity] FAIL: python check crashed"
+    echo "  $PARITY"
+  fi
   echo
 }
 
