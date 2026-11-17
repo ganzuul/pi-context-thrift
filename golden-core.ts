@@ -45,7 +45,7 @@ const TOOLCALL_TYPES = new Set(["toolCall", "tool_call", "functionCall", "functi
 // ---- config ----
 
 /** What a golden store is scoped to. See `scopeKeyFor` for the resolution rules. */
-export type StoreScope = "cwd" | "git" | "global";
+export type StoreScope = "session" | "cwd" | "git" | "global";
 
 export interface GoldenConfig {
   /** master switch; when false the adapter is a no-op. */
@@ -87,10 +87,10 @@ export interface GoldenConfig {
   stripThinkingOnSpend: boolean;
   /** cap on the rendered golden section (bytes) so a runaway log cannot blow the prefix. */
   maxGoldenSectionBytes: number;
-  /** What the store is scoped to. "cwd" = the directory pi was launched in (a new project starts
-   *  with a FRESH golden instead of inheriting another project's decisions); "git" = nearest
-   *  ancestor with a .git, so subdirs of one repo share memory; "global" = the historic single
-   *  machine-wide store. The scope key nests inside goldenStoreRel's own directory. */
+  /** What the store is scoped to. "session" = one isolated store per pi session ID
+   *  (persisted across resumes, fresh on every new session in any directory);
+   *  "cwd" = the directory pi was launched in; "git" = nearest ancestor with .git;
+   *  "global" = the historic single machine-wide store. */
   scope: StoreScope;
   /** store file, resolved relative to the agent dir by the adapter. */
   goldenStoreRel: string;
@@ -114,7 +114,7 @@ export const DEFAULT_CONFIG: GoldenConfig = {
   minResultBytesToEject: 2048,
   stripThinkingOnSpend: true,       // the DISTILL rule is the point; conservative elsewhere
   maxGoldenSectionBytes: 16_000,
-  scope: "cwd",                    // a new directory must NOT inherit another project's golden
+  scope: "session",                // each pi session starts fresh (even in the same directory)
   goldenStoreRel: "golden-context/golden.jsonl",
   handleTemplate: "[golden] {toolName} #{id} ejected ({bytes}B) — consumed into later work",
 };
@@ -143,7 +143,7 @@ export function parseConfig(raw: unknown): GoldenConfig {
     minResultBytesToEject: Math.max(0, Math.floor(num(o.minResultBytesToEject, DEFAULT_CONFIG.minResultBytesToEject))),
     stripThinkingOnSpend: typeof o.stripThinkingOnSpend === "boolean" ? o.stripThinkingOnSpend : DEFAULT_CONFIG.stripThinkingOnSpend,
     maxGoldenSectionBytes: Math.max(0, Math.floor(num(o.maxGoldenSectionBytes, DEFAULT_CONFIG.maxGoldenSectionBytes))),
-    scope: o.scope === "cwd" || o.scope === "git" || o.scope === "global"
+    scope: o.scope === "session" || o.scope === "cwd" || o.scope === "git" || o.scope === "global"
       ? o.scope : DEFAULT_CONFIG.scope,
     goldenStoreRel: typeof o.goldenStoreRel === "string" && o.goldenStoreRel ? o.goldenStoreRel : DEFAULT_CONFIG.goldenStoreRel,
     handleTemplate: typeof o.handleTemplate === "string" && o.handleTemplate ? o.handleTemplate : DEFAULT_CONFIG.handleTemplate,
@@ -178,18 +178,51 @@ export function findGitRoot(startAbs: string, exists: (p: string) => boolean): s
 }
 
 /**
- * The directory segment a store lives under, or null for the historic single machine-wide store.
- * "git" degrades to "cwd" when the launch dir is not inside a repo — an un-repoed directory has
- * no better key than itself.
+ * Sanitize a pi session ID into a single safe directory-name segment.
+ * Standard UUIDv7 session IDs pass through unchanged; path separators, dots, and
+ * control characters are replaced so an untrusted ID cannot traverse directories.
+ */
+export function encodeSessionScope(sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9_-]/g, "_").replace(/^_+/, "");
+  return safe || "unknown";
+}
+
+/**
+ * The relative directory segment(s) a store lives under, or null for `scope:"global"`.
+ * - "session": `sessions/<safe-sessionId>` when a session ID is present (falls back to
+ *   `encodeCwdScope(cwd)` only when a stub host supplies no session ID).
+ * - "git": `encodeCwdScope(gitRoot)` (falls back to `cwd` outside a git repo).
+ * - "cwd": `encodeCwdScope(cwd)`.
  */
 export function scopeKeyFor(
   cfg: Pick<GoldenConfig, "scope">,
   cwd: string,
   gitRoot: string | null,
+  sessionId?: string | null,
 ): string | null {
   if (cfg.scope === "global") return null;
+  if (cfg.scope === "session") {
+    const id = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (id) return `sessions/${encodeSessionScope(id)}`;
+    return encodeCwdScope(cwd);
+  }
   if (cfg.scope === "git" && gitRoot) return encodeCwdScope(gitRoot);
   return encodeCwdScope(cwd);
+}
+
+/**
+ * Filter a parent session's golden entries when forking a branch so pre-fork checkpoints
+ * and decisions survive without leaking entries created after the branch timestamp.
+ */
+export function filterEntriesForFork(entries: GoldenEntry[], maxBranchTs: number): GoldenEntry[] {
+  if (!Number.isFinite(maxBranchTs)) return [];
+  return entries.filter((e) => {
+    if (e.kind === "checkpoint") {
+      const bound = e.keepTs ?? e.coveredTs ?? e.ts;
+      return bound <= maxBranchTs;
+    }
+    return e.ts <= maxBranchTs;
+  });
 }
 
 // ---- golden store records ----

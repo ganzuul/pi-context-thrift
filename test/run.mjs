@@ -293,32 +293,55 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
   check("dry-run classifies fold-text + eject-result + strip", planDry.items.some((i) => i.action === "fold-text") && planDry.items.some((i) => i.action === "eject-result"));
 }
 
-// ---- store scoping (the bug: one global store leaked every project's golden into new dirs) ----
+// ---- store scoping (per pi session by default, with cwd/git/global opt-ins) ----
 {
   const s = core.parseConfig({});
-  check("default scope is cwd (fresh context per directory)", s.scope === "cwd");
-  check("scope:global / scope:git honored",
-    core.parseConfig({ scope: "global" }).scope === "global" && core.parseConfig({ scope: "git" }).scope === "git");
-  check("invalid scope falls back to cwd", core.parseConfig({ scope: "nonsense" }).scope === "cwd");
+  check("default scope is session (fresh context per pi session)", s.scope === "session");
+  check("scope:cwd / scope:global / scope:git honored",
+    core.parseConfig({ scope: "cwd" }).scope === "cwd"
+    && core.parseConfig({ scope: "global" }).scope === "global"
+    && core.parseConfig({ scope: "git" }).scope === "git");
+  check("invalid scope falls back to session", core.parseConfig({ scope: "nonsense" }).scope === "session");
 
   // must match pi's OWN per-directory session naming, not an invention of ours
   check("encodeCwdScope: posix path", core.encodeCwdScope("/srv/users/dev/projects/alpha") === "--srv-users-dev-projects-alpha--");
   check("encodeCwdScope: strips leading slash, maps : and \\ to -",
     core.encodeCwdScope("/C:/Users/me/proj") === "--C--Users-me-proj--");
+  check("encodeSessionScope: keeps UUID intact and neutralizes traversal/slashes",
+    core.encodeSessionScope("01a18e86-3b66-751b-973e-77b30e7eaf99") === "01a18e86-3b66-751b-973e-77b30e7eaf99"
+    && !core.encodeSessionScope("../evil/path").includes("/")
+    && !core.encodeSessionScope("../evil/path").includes("..")
+    && core.encodeSessionScope("..") === "unknown");
 
   const dirs = new Set(["/repo/.git", "/repo/sub/other"]);
   check("findGitRoot: nearest ancestor with .git", core.findGitRoot("/repo/sub/pkg", (p) => dirs.has(p)) === "/repo");
   check("findGitRoot: worktree/submodule (.git FILE)", core.findGitRoot("/repo/x", (p) => p === "/repo/.git") === "/repo");
   check("findGitRoot: null outside a repo", core.findGitRoot("/a/b", () => false) === null);
 
+  check("scopeKeyFor: session uses sessions/<id> regardless of cwd",
+    core.scopeKeyFor({ scope: "session" }, "/x/y", "/x", "sess-123") === "sessions/sess-123");
+  check("scopeKeyFor: session falls back to cwd only when sessionId is missing",
+    core.scopeKeyFor({ scope: "session" }, "/x/y", null, "") === "--x-y--");
   check("scopeKeyFor: global -> null (historic single store)",
-    core.scopeKeyFor({ scope: "global" }, "/x/y", null) === null);
+    core.scopeKeyFor({ scope: "global" }, "/x/y", null, "sess-123") === null);
   check("scopeKeyFor: git uses the repo root",
-    core.scopeKeyFor({ scope: "git" }, "/repo/sub", "/repo") === "--repo--");
+    core.scopeKeyFor({ scope: "git" }, "/repo/sub", "/repo", "sess-123") === "--repo--");
   check("scopeKeyFor: git degrades to cwd when not a repo",
-    core.scopeKeyFor({ scope: "git" }, "/loose/dir", null) === "--loose-dir--");
-  check("scopeKeyFor: cwd ignores the git root",
-    core.scopeKeyFor({ scope: "cwd" }, "/repo/sub", "/repo") === "--repo-sub--");
+    core.scopeKeyFor({ scope: "git" }, "/loose/dir", null, "sess-123") === "--loose-dir--");
+  check("scopeKeyFor: cwd ignores the git root and sessionId",
+    core.scopeKeyFor({ scope: "cwd" }, "/repo/sub", "/repo", "sess-123") === "--repo-sub--");
+
+  const forkEntries = [
+    { seq: 0, ts: 1000, kind: "record", text: "early", spend: [] },
+    { seq: 1, ts: 1100, kind: "checkpoint", text: "ckpt", spend: [], coveredTs: 1050, keepTs: 1060 },
+    { seq: 2, ts: 2500, kind: "record", text: "post-fork", spend: [] },
+    { seq: 3, ts: 2600, kind: "checkpoint", text: "later-ckpt", spend: [], coveredTs: 2400, keepTs: 2500 },
+  ];
+  const kept = core.filterEntriesForFork(forkEntries, 1500);
+  check("filterEntriesForFork keeps pre-fork entries and excludes post-fork ones",
+    kept.map((e) => e.seq).join(",") === "0,1");
+  check("filterEntriesForFork yields empty on empty branch (-Infinity)",
+    core.filterEntriesForFork(forkEntries, Number.NEGATIVE_INFINITY).length === 0);
 }
 
 // ---- undo helpers (pure) ----
@@ -388,10 +411,17 @@ check("parseCommitArgs handles empty args", (() => { const r = core.parseCommitA
     && core.replaceGoldenSection("a\n<golden>\n1\n</golden>\n", "") === null);
 }
 
-// Deterministic launch dir for the adapter tests: the store is scoped per directory, so this
-// fixture cwd decides where the adapter reads/writes golden.jsonl.
+// Deterministic launch dir + session ID for adapter tests: under default session scope,
+// the store resolves to <agentDir>/golden-context/sessions/<FIXTURE_SESSION>/golden.jsonl.
 const FIXTURE_CWD = "/golden-fixture-project";
-const STORE = join(AGENT, "golden-context", core.encodeCwdScope(FIXTURE_CWD), "golden.jsonl");
+const FIXTURE_SESSION = "01a10000-0000-7000-8000-000000000001";
+const STORE = join(AGENT, "golden-context", "sessions", FIXTURE_SESSION, "golden.jsonl");
+const fixtureSm = (extra = {}) => ({
+  getCwd: () => FIXTURE_CWD,
+  getSessionId: () => FIXTURE_SESSION,
+  getSessionFile: () => join(AGENT, "sessions", "s1.jsonl"),
+  ...extra,
+});
 
 // ---- ADAPTER end-to-end via the stubbed pi surface ----
 const adapter = jiti(join(__dirname, "..", "golden-context.ts"));
@@ -411,7 +441,7 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
 
 // drive session_start (fresh store), commit via tool, then assert golden section + spend
 (async () => {
-  await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+  await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: fixtureSm() });
   const toolRes = await registeredTools.commit_decision.execute("tc1", { decision: "record", text: "lower ctx to free VRAM", spendToolCallIds: ["id9"] }, undefined, undefined, { cwd: process.cwd() });
   check("commit returns confirmation text", typeof toolRes.content?.[0]?.text === "string" && /Golden committed/.test(toolRes.content[0].text));
 
@@ -470,7 +500,7 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
   // with tailKeep=0 the same dry run plans the ejection of the spent result
   const { writeFileSync } = require("node:fs");
   writeFileSync(join(AGENT, "golden-context", "config.json"), JSON.stringify({ tailKeepToolResults: 0 }));
-  await handlers.session_start[0]({}, { cwd: FIXTURE_CWD }); // reload config from disk
+  await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: fixtureSm() }); // reload config from disk
   notices.length = 0;
   await registeredCommands["golden-eject"].handler("", fakeCtx);
   check("/golden-eject plans ejection past the tail", notices.some((n) => /would change 1 message/.test(n) && /eject-result .*cmdA/.test(n)));
@@ -773,7 +803,7 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
     // reloads only from disk. Without consulting the undo archive for the high-water
     // mark, the next commit would REUSE the popped seq (this check bites: pre-fix,
     // loadEntries sees kept-max+1 === removedEntry.seq).
-    await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+    await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: fixtureSm() });
     await registeredCommands["golden-commit"].handler("record after-restart marker", fakeCtx);
     const newest = JSON.parse(readFileSync(storePath, "utf8").trim().split("\n").pop());
     check("seq high-water survives a restart after undo (archive consulted)", newest.seq > removedEntry.seq);
@@ -799,37 +829,93 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
       statusNotices.some((n) => n.includes(`(${storeNow} entries`)));
   }
 
-  // ---- SCOPE ISOLATION (the reported bug): another directory must start with a FRESH golden ----
+  // ---- SESSION ISOLATION (same directory, separate pi sessions stay fresh) ----
   {
-    const { existsSync, readFileSync } = require("node:fs");
-    const OTHER_CWD = "/golden-other-project";
-    const OTHER_STORE = join(AGENT, "golden-context", core.encodeCwdScope(OTHER_CWD), "golden.jsonl");
+    const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+    const OTHER_SESSION = "01a10000-0000-7000-8000-000000000002";
+    const OTHER_STORE = join(AGENT, "golden-context", "sessions", OTHER_SESSION, "golden.jsonl");
     const fixtureLinesBefore = storeLines();
 
-    await handlers.session_start[0]({}, { cwd: OTHER_CWD });
+    await handlers.session_start[0]({ reason: "new" }, {
+      cwd: FIXTURE_CWD,
+      sessionManager: {
+        getCwd: () => FIXTURE_CWD,
+        getSessionId: () => OTHER_SESSION,
+        getSessionFile: () => join(AGENT, "sessions", "s2.jsonl"),
+      },
+    });
     const evFresh = { systemPromptOptions: { sections: {} } };
-    handlers.before_agent_start[0](evFresh, { cwd: OTHER_CWD });
-    check("new directory renders NO golden from the other project",
+    handlers.before_agent_start[0](evFresh, {
+      cwd: FIXTURE_CWD,
+      sessionManager: { getCwd: () => FIXTURE_CWD, getSessionId: () => OTHER_SESSION, getSessionFile: () => join(AGENT, "sessions", "s2.jsonl") },
+    });
+    check("new session in the SAME directory renders NO golden from the earlier session",
       !String(evFresh.systemPromptOptions.sections.golden ?? "").includes("lower ctx to free VRAM"));
 
-    await registeredTools.commit_decision.execute(
-      "tcOTHER", { decision: "record", text: "UNIQUE-OTHER-PROJECT-DECISION", spendToolCallIds: [] },
-      undefined, undefined, { cwd: OTHER_CWD });
-    check("commit in the other scope writes ONLY its own store",
-      existsSync(OTHER_STORE) && readFileSync(OTHER_STORE, "utf8").includes("UNIQUE-OTHER-PROJECT-DECISION"));
-    check("the original scope's store is untouched by the other project",
-      storeLines() === fixtureLinesBefore && !readFileSync(storePath, "utf8").includes("UNIQUE-OTHER-PROJECT-DECISION"));
-    check("scoped stores are siblings under the agent dir, each in its own scope dir",
-      OTHER_STORE !== storePath
-        && OTHER_STORE.startsWith(join(AGENT, "golden-context") + "/")
-        && OTHER_STORE.includes(core.encodeCwdScope(OTHER_CWD))
-        && storePath.includes(core.encodeCwdScope(FIXTURE_CWD)));
+    // Transient state reset check: sess-A had a high kvAnchor (85k) and ckpt status;
+    // sess-B must NOT inherit that anchor and misfire threshold/in-flight compaction.
+    const statusAfterSwitch = [];
+    await registeredCommands["golden-status"].handler("", {
+      ui: { notify: (m) => statusAfterSwitch.push(String(m)), setWidget: (_k, l) => statusAfterSwitch.push(l.join("\n")) },
+      sessionManager: { getCwd: () => FIXTURE_CWD, getSessionId: () => OTHER_SESSION, getSessionFile: () => join(AGENT, "sessions", "s2.jsonl") },
+      getContextUsage: () => undefined,
+    });
+    check("transient ckpt status resets across session switch",
+      statusAfterSwitch.every((s) => !/context counter:/.test(s)));
 
-    await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+    await registeredTools.commit_decision.execute(
+      "tcOTHER", { decision: "record", text: "UNIQUE-OTHER-SESSION-DECISION", spendToolCallIds: [] },
+      undefined, undefined, { cwd: FIXTURE_CWD, sessionManager: { getCwd: () => FIXTURE_CWD, getSessionId: () => OTHER_SESSION, getSessionFile: () => join(AGENT, "sessions", "s2.jsonl") } });
+    check("commit in the other session writes ONLY its own store",
+      existsSync(OTHER_STORE) && readFileSync(OTHER_STORE, "utf8").includes("UNIQUE-OTHER-SESSION-DECISION"));
+    check("the original session's store is untouched by the sibling session",
+      storeLines() === fixtureLinesBefore && !readFileSync(storePath, "utf8").includes("UNIQUE-OTHER-SESSION-DECISION"));
+    check("session stores live separately under sessions/<id>",
+      OTHER_STORE !== storePath
+        && OTHER_STORE.startsWith(join(AGENT, "golden-context", "sessions") + "/")
+        && OTHER_STORE.includes(OTHER_SESSION)
+        && storePath.includes(FIXTURE_SESSION));
+
+    // Resuming the original session (even from a different cwd string) restores its golden
+    await handlers.session_start[0]({ reason: "resume" }, { cwd: "/some/other/launch/dir", sessionManager: fixtureSm() });
     const evBack = { systemPromptOptions: { sections: {} } };
-    handlers.before_agent_start[0](evBack, { cwd: FIXTURE_CWD });
-    check("returning to the original directory restores ITS golden",
+    handlers.before_agent_start[0](evBack, { cwd: "/some/other/launch/dir", sessionManager: fixtureSm() });
+    check("resuming the original session restores ITS golden",
       String(evBack.systemPromptOptions.sections.golden ?? "").includes("lower ctx to free VRAM"));
+
+    // Forking seeds pre-fork entries up to the branch tip without mutating the parent
+    const parentJsonl = join(AGENT, "parent-session.jsonl");
+    writeFileSync(parentJsonl, JSON.stringify({ type: "session", version: 3, id: FIXTURE_SESSION, timestamp: "2026-10-01T00:00:00.000Z", cwd: FIXTURE_CWD }) + "\n");
+    const FORK_SESSION = "01a10000-0000-7000-8000-000000000003";
+    const FORK_STORE = join(AGENT, "golden-context", "sessions", FORK_SESSION, "golden.jsonl");
+    const forkFutureTs = Date.now() + 60_000;
+    await handlers.session_start[0]({ reason: "fork", previousSessionFile: parentJsonl }, {
+      cwd: FIXTURE_CWD,
+      sessionManager: {
+        getCwd: () => FIXTURE_CWD,
+        getSessionId: () => FORK_SESSION,
+        getSessionFile: () => join(AGENT, "sessions", "s3.jsonl"),
+        getHeader: () => ({ type: "session", id: FORK_SESSION, parentSession: parentJsonl }),
+        getBranch: () => [{ id: "m1", type: "message", timestamp: new Date(forkFutureTs).toISOString(), message: { role: "user", timestamp: forkFutureTs, content: [{ type: "text", text: "forked" }] } }],
+      },
+    });
+    check("forked session seeds its own store from parent branch",
+      existsSync(FORK_STORE) && readFileSync(FORK_STORE, "utf8").includes("lower ctx to free VRAM"));
+
+    // --no-session (getSessionFile() === undefined): operates in-memory with zero disk files
+    const EPHEM_SESSION = "01a10000-0000-7000-8000-000000000004";
+    const EPHEM_STORE = join(AGENT, "golden-context", "sessions", EPHEM_SESSION, "golden.jsonl");
+    await handlers.session_start[0]({ reason: "startup" }, {
+      cwd: FIXTURE_CWD,
+      sessionManager: { getCwd: () => FIXTURE_CWD, getSessionId: () => EPHEM_SESSION, getSessionFile: () => undefined },
+    });
+    await registeredTools.commit_decision.execute(
+      "tcEPHEM", { decision: "record", text: "EPHEMERAL-MEM-ONLY", spendToolCallIds: [] },
+      undefined, undefined, { cwd: FIXTURE_CWD, sessionManager: { getCwd: () => FIXTURE_CWD, getSessionId: () => EPHEM_SESSION, getSessionFile: () => undefined } });
+    const evEphem = { systemPromptOptions: { sections: {} } };
+    handlers.before_agent_start[0](evEphem);
+    check("--no-session keeps entries in memory without writing to disk",
+      !existsSync(EPHEM_STORE) && String(evEphem.systemPromptOptions.sections.golden ?? "").includes("EPHEMERAL-MEM-ONLY"));
   }
 
   // ---- retention gate END-TO-END through the real `context` hook + status surfacing ----
@@ -842,14 +928,14 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
       core.entryToJsonLine({ seq: 0, ts: 1, kind: "checkpoint", text: `[user] DROP-ME-OUT ${"d".repeat(320)}`, spend: ["gA"], coveredTs: 100, keepTs: 101 }),
       core.entryToJsonLine({ seq: 1, ts: 2, kind: "checkpoint", text: "KEPT-BAND checkpoint", spend: ["gB"], coveredTs: 200, keepTs: 201 }),
     ].join("\n") + "\n");
-    await handlers.session_start[0]({}, { cwd: FIXTURE_CWD });
+    await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: fixtureSm() });
 
     const ancient = { role: "user", content: [{ type: "text", text: "ANCIENT-OUTSIDE-BAND" }], timestamp: 50 };
     const bigResult = { role: "toolResult", toolCallId: "gA", toolName: "bash", isError: false, timestamp: 60, content: [{ type: "text", text: "x".repeat(5000) }] };
     const recent = { role: "user", content: [{ type: "text", text: "RECENT-INSIDE-BAND" }], timestamp: 150 };
     const hookCtx = { cwd: FIXTURE_CWD, isIdle: () => true,
       ui: { notify() {}, setStatus() {}, setWidget() {} },
-      sessionManager: { getBranch: () => [] }, getContextUsage: () => undefined };
+      sessionManager: fixtureSm({ getBranch: () => [] }), getContextUsage: () => undefined };
     const ev = { messages: [ancient, bigResult, recent] };
     const out = await handlers.context[0](ev, hookCtx);
     const msgs = out?.messages ?? ev.messages;

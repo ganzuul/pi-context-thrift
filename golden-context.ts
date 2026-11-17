@@ -45,6 +45,7 @@ import {
   entryToJsonLine,
   estimateContextChars,
   estimateContextSize,
+  filterEntriesForFork,
   findGitRoot,
   formatStatus,
   formatTokens,
@@ -94,8 +95,12 @@ interface LiveState {
   cfg: GoldenConfig;
   entries: GoldenEntry[];
   seq: number;
-  /** launch dir the live store is currently scoped to (see config `scope`) */
+  /** launch dir of the active session (used by `cwd`/`git` scopes and legacy fallbacks) */
   cwd: string;
+  /** active pi session ID (used by default `session` scope) */
+  sessionId: string;
+  /** false when running under `--no-session` (in-memory SessionManager; skip disk store writes) */
+  persisted: boolean;
   /** rendered system prompt of the active run (golden section included) — the prefill splice base */
   runSystemPrompt?: string | undefined;
   /** the golden section text as injected for the active run (strict prefix of any later render) */
@@ -123,16 +128,16 @@ interface LiveState {
 }
 
 /**
- * Golden store path, SCOPED by launch directory (config `scope`).
+ * Golden store path, scoped by `cfg.scope` (default `"session"`).
  *
- * Was a single machine-wide file, which meant pi started in project B inherited project A's
- * golden lines — the opposite of a fresh context. The scope key nests inside goldenStoreRel's
- * own directory, so `<agentDir>/golden-context/<--cwd-->/golden.jsonl`.
- * `scope:"global"` reproduces the old path exactly for anyone who wants it back.
+ * - `"session"` -> `<agentDir>/golden-context/sessions/<safe-sessionId>/golden.jsonl`
+ *   (falls back to `<--cwd-->` only when a stub host provides no session ID)
+ * - `"cwd"` / `"git"` -> `<agentDir>/golden-context/<--dir-->/golden.jsonl`
+ * - `"global"` -> `<agentDir>/golden-context/golden.jsonl`
  */
-function resolveStorePath(cfg: GoldenConfig, cwd: string): string {
+function resolveStorePath(cfg: GoldenConfig, cwd: string, sessionId?: string): string {
   const gitRoot = cfg.scope === "git" ? findGitRoot(cwd, existsSync) : null;
-  const key = scopeKeyFor(cfg, cwd, gitRoot);
+  const key = scopeKeyFor(cfg, cwd, gitRoot, sessionId);
   const rel = cfg.goldenStoreRel;
   const base = isAbsolute(rel) ? dirname(rel) : join(getAgentDir(), dirname(rel));
   return key ? join(base, key, basename(rel)) : join(base, basename(rel));
@@ -216,25 +221,162 @@ function dumpRequest(source: "agent" | "evidence" | "prefill", payload: unknown)
 }
 
 export default function goldenContextExtension(pi: ExtensionAPI): void {
-  const state: LiveState = { cfg: loadConfig(), entries: [], seq: 0, cwd: process.cwd(), ckptInFlight: false };
+  const state: LiveState = {
+    cfg: loadConfig(),
+    entries: [],
+    seq: 0,
+    cwd: process.cwd(),
+    sessionId: "",
+    persisted: true,
+    ckptInFlight: false,
+  };
 
   /** Spent ids that the RENDERED golden can still justify: a spend recorded by an entry the
    *  byte cap dropped must not keep that tool result ejected (retention gate, findings §17). */
   const refresh = (): Set<string> => collectSpentIds(selectRenderedEntries(state.entries, state.cfg));
 
-  /**
-   * Adopt a launch dir: point the live store at that scope and load its own entries.
-   * No-op while the dir is unchanged, so hooks can call it defensively on every event.
-   * Returns true when the scope (and therefore `state.entries`) actually changed.
-   */
-  function adoptScope(cwd: unknown): boolean {
-    if (typeof cwd !== "string" || !cwd || cwd === state.cwd) return false;
-    state.cwd = cwd;
-    const storePath = resolveStorePath(state.cfg, state.cwd);
+  function resetTransientState(): void {
+    if (state.warmRetry) {
+      clearTimeout(state.warmRetry);
+      state.warmRetry = undefined;
+    }
+    state.runSystemPrompt = undefined;
+    state.runGoldenRender = undefined;
+    state.wireSystem = undefined;
+    state.lastWarmKey = undefined;
+    state.lastCkptStatus = undefined;
+    state.lastCkptMeasured = false;
+    state.kvAnchor = undefined;
+  }
+
+  function extractCtxScope(ctx: unknown): { cwd?: string; sessionId?: string; persisted?: boolean } {
+    const c = ctx as {
+      cwd?: unknown;
+      sessionManager?: {
+        getCwd?: () => unknown;
+        getSessionId?: () => unknown;
+        getSessionFile?: () => unknown;
+      };
+    } | undefined;
+    const sm = c?.sessionManager;
+    const smCwd = typeof sm?.getCwd === "function" ? sm.getCwd() : undefined;
+    const rawCwd = typeof smCwd === "string" && smCwd ? smCwd : c?.cwd;
+    const cwd = typeof rawCwd === "string" && rawCwd ? rawCwd : undefined;
+    const rawSid = typeof sm?.getSessionId === "function" ? sm.getSessionId() : undefined;
+    const sessionId = typeof rawSid === "string" && rawSid.trim() ? rawSid.trim() : undefined;
+    const persisted = typeof sm?.getSessionFile === "function" ? Boolean(sm.getSessionFile()) : undefined;
+    return { cwd, sessionId, persisted };
+  }
+
+  function currentStorePath(): string {
+    return resolveStorePath(state.cfg, state.cwd, state.sessionId);
+  }
+
+  function reloadActiveStore(): void {
+    if (!state.persisted) {
+      state.entries = [];
+      state.seq = 0;
+      return;
+    }
+    const storePath = currentStorePath();
     ensureStoreDir(storePath);
     const { entries, seq } = loadStoreWithWatermark(storePath);
     state.entries = entries;
     state.seq = seq;
+  }
+
+  /**
+   * When a new session is forked from an existing persisted session, seed its store
+   * once with the parent's pre-fork entries (up to the branch timestamp) so compacted
+   * checkpoints already referenced in the branched history stay available in `<golden>`.
+   */
+  function seedForkedStoreIfNeeded(event: unknown, ctx: unknown): void {
+    if (state.cfg.scope !== "session" || !state.persisted || !state.sessionId) return;
+    const storePath = currentStorePath();
+    if (existsSync(storePath)) return;
+    const c = ctx as {
+      sessionManager?: {
+        getHeader?: () => { parentSession?: unknown } | null;
+        getBranch?: () => SessionEntry[];
+      };
+    } | undefined;
+    const ev = event as { reason?: unknown; previousSessionFile?: unknown } | undefined;
+    const headerParent = c?.sessionManager?.getHeader?.()?.parentSession;
+    const parentFile =
+      typeof headerParent === "string" && headerParent
+        ? headerParent
+        : ev?.reason === "fork" && typeof ev?.previousSessionFile === "string" && ev.previousSessionFile
+          ? ev.previousSessionFile
+          : undefined;
+    if (!parentFile || !existsSync(parentFile)) return;
+    try {
+      const firstLine = readFileSync(parentFile, "utf8").split("\n", 1)[0];
+      if (!firstLine) return;
+      const parentHdr = JSON.parse(firstLine) as { type?: string; id?: string; cwd?: string };
+      if (parentHdr.type !== "session" || typeof parentHdr.id !== "string" || !parentHdr.id) return;
+      const parentStorePath = resolveStorePath(state.cfg, parentHdr.cwd || state.cwd, parentHdr.id);
+      if (parentStorePath === storePath || !existsSync(parentStorePath)) return;
+
+      const branch = typeof c?.sessionManager?.getBranch === "function" ? c.sessionManager.getBranch() : [];
+      let maxBranchTs = Number.NEGATIVE_INFINITY;
+      for (const e of branch) {
+        const entry = e as { timestamp?: unknown; message?: { timestamp?: unknown } };
+        if (typeof entry.message?.timestamp === "number") {
+          maxBranchTs = Math.max(maxBranchTs, entry.message.timestamp);
+        }
+        if (typeof entry.timestamp === "string") {
+          const parsed = Date.parse(entry.timestamp);
+          if (Number.isFinite(parsed)) maxBranchTs = Math.max(maxBranchTs, parsed);
+        }
+      }
+      const { entries: parentEntries } = loadStoreWithWatermark(parentStorePath);
+      const kept = filterEntriesForFork(parentEntries, maxBranchTs);
+      if (kept.length === 0) return;
+      ensureStoreDir(storePath);
+      writeFileSync(storePath, kept.map(entryToJsonLine).join("\n") + "\n", "utf8");
+    } catch {
+      /* best-effort fork seeding; never block session_start */
+    }
+  }
+
+  /**
+   * Adopt the active session/dir scope when hooks observe a change without a fresh
+   * session_start (or when a host updates ctx between calls). Never drops an active
+   * sessionId when a minimal caller omits sessionManager.
+   */
+  function adoptScope(ctx: unknown): boolean {
+    const { cwd, sessionId, persisted } = extractCtxScope(ctx);
+    const prevKey = scopeKeyFor(state.cfg, state.cwd, null, state.sessionId);
+    let nextCwd = state.cwd;
+    let nextSessionId = state.sessionId;
+    let nextPersisted = state.persisted;
+
+    if (persisted !== undefined && persisted !== state.persisted) {
+      nextPersisted = persisted;
+    }
+    if (state.cfg.scope === "session") {
+      if (sessionId) {
+        nextSessionId = sessionId;
+        if (cwd) nextCwd = cwd;
+      } else if (!state.sessionId && cwd) {
+        nextCwd = cwd;
+      }
+    } else if (cwd && cwd !== state.cwd) {
+      nextCwd = cwd;
+    }
+
+    const nextKey = scopeKeyFor(state.cfg, nextCwd, null, nextSessionId);
+    const gitChanged = state.cfg.scope === "git" && nextCwd !== state.cwd;
+    if (nextKey === prevKey && !gitChanged && nextPersisted === state.persisted) {
+      if (cwd) state.cwd = cwd;
+      return false;
+    }
+
+    state.cwd = nextCwd;
+    state.sessionId = nextSessionId;
+    state.persisted = nextPersisted;
+    resetTransientState();
+    reloadActiveStore();
     return true;
   }
 
@@ -249,9 +391,11 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       ...(coveredTs !== undefined ? { coveredTs } : {}),
       ...(keepTs !== undefined ? { keepTs } : {}),
     };
-    const storePath = resolveStorePath(state.cfg, state.cwd);
-    ensureStoreDir(storePath);
-    await appendLine(storePath, entryToJsonLine(entry));
+    if (state.persisted) {
+      const storePath = currentStorePath();
+      ensureStoreDir(storePath);
+      await appendLine(storePath, entryToJsonLine(entry));
+    }
     state.entries.push(entry);
     return entry;
   }
@@ -299,23 +443,30 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     }
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     state.cfg = loadConfig();
-    // The store is scoped by launch dir: a new project must start with a FRESH golden,
-    // not pi-ctx's or another repo's accumulated decisions. ctx.cwd is pi's own resolved
-    // session dir (ExtensionContext.cwd); process.cwd() only if a host hands us no context.
-    const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
-    state.cwd = cwd;
-    const storePath = resolveStorePath(state.cfg, state.cwd);
-    ensureStoreDir(storePath);
-    const { entries, seq } = loadStoreWithWatermark(storePath);
-    state.entries = entries;
-    state.seq = seq;
+    const { cwd, sessionId, persisted } = extractCtxScope(ctx);
+    const nextCwd = cwd ?? process.cwd();
+    const nextSessionId = sessionId ?? "";
+    const nextPersisted = persisted ?? true;
+    const reason = (event as { reason?: unknown } | undefined)?.reason;
+    const scopeChanged =
+      nextCwd !== state.cwd ||
+      nextSessionId !== state.sessionId ||
+      nextPersisted !== state.persisted;
+    if (scopeChanged || reason !== "reload") {
+      resetTransientState();
+    }
+    state.cwd = nextCwd;
+    state.sessionId = nextSessionId;
+    state.persisted = nextPersisted;
+    seedForkedStoreIfNeeded(event, ctx);
+    reloadActiveStore();
   });
 
   pi.on("before_agent_start", (event, ctx) => {
     if (!state.cfg.enabled) return;
-    adoptScope(ctx?.cwd); // scope can only have moved; re-point before rendering golden
+    adoptScope(ctx); // re-point if session/scope shifted without session_start
     // Capture the exact rendered prompt for the idle prefill FIRST (even when no golden
     // section exists yet — the FIRST checkpoint appends the whole wrapped section).
     state.runSystemPrompt = event.systemPrompt;
@@ -331,7 +482,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
 
   pi.on("context", async (event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled) return;
-    adoptScope(ctx?.cwd); // pi fixes cwd per session, but commits must land in the right scope
+    adoptScope(ctx);
     // IN-FLIGHT compaction — "our own solution for when context is full": if the request
     // about to go out crosses contextFullPct of the window, fold the covered history into
     // a checkpoint RIGHT HERE (mid-run), then purge below. The evidence call is bounded
@@ -595,6 +746,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled || !state.cfg.autoCheckpoint) return;
+    adoptScope(ctx);
     if (state.ckptInFlight) return;
     state.ckptPromise = runCheckpoint(ctx).finally(() => { state.ckptPromise = undefined; }); // fire-and-forget on purpose (see note above)
   });
@@ -610,6 +762,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
    */
   pi.on("session_before_compact", async (event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled || !state.cfg.takeoverCompaction) return; // pi's compaction runs as-is
+    adoptScope(ctx);
     const inflight = state.ckptPromise;
     if (inflight) {
       await Promise.race([inflight, new Promise((r) => setTimeout(r, 10_000))]);
@@ -720,7 +873,8 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       "Use sparingly — only information that must survive the compaction filter.",
     promptSnippet: "Persist a durable decision or spend tool output into golden context.",
     parameters: CommitParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<never> {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<never> {
+      adoptScope(ctx);
       const kind: DecisionKind = params.decision;
       const entry = await commitEntry(
         kind,
@@ -740,7 +894,8 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.registerCommand("golden-status", {
     description: "Show golden-context state (store, config, spent toolCallIds, context usage)",
     handler: async (_args, ctx) => {
-      const storePath = resolveStorePath(state.cfg, state.cwd);
+      adoptScope(ctx);
+      const storePath = state.persisted ? currentStorePath() : `in-memory (${state.sessionId || "no-session"})`;
       const usage = ctx.getContextUsage();
       const rendered = selectRenderedEntries(state.entries, state.cfg);
       report(ctx, "golden-status", formatStatus({
@@ -764,6 +919,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.registerCommand("golden-render", {
     description: "Show the exact <golden> section bytes injected into the system prompt",
     handler: async (_args, ctx) => {
+      adoptScope(ctx);
       const section = renderGoldenSection(state.entries, state.cfg);
       const body = section
         ? `${Buffer.byteLength(section, "utf8")} bytes (append-only: committed lines never change)\n\n${section}`
@@ -775,6 +931,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.registerCommand("golden-commit", {
     description: "Commit a golden entry by hand: /golden-commit [record|distill|churn|discard] [spend:id1,id2] <text>",
     handler: async (args, ctx) => {
+      adoptScope(ctx);
       const { kind, text, spend } = parseCommitArgs(args);
       if (!text) {
         report(ctx, "golden-commit", "usage: /golden-commit [record|distill|churn|discard] [spend:id1,id2] <text>");
@@ -789,6 +946,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.registerCommand("golden-eject", {
     description: "Dry-run: report what would be ejected/stripped/folded from the transcript right now",
     handler: async (_args, ctx) => {
+      adoptScope(ctx);
       // Transcript view of the live branch: message entries in order (the `context` hook
       // sees the same messages just before each LLM call; this never modifies anything).
       const entries: SessionEntry[] = ctx.sessionManager.getBranch();
@@ -820,6 +978,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.registerCommand("golden-undo", {
     description: "Undo golden entries: /golden-undo [n] (default 1). Store is truncated; popped lines go to golden.undone.jsonl. Popping a checkpoint restores its purged content next request.",
     handler: async (args, ctx) => {
+      adoptScope(ctx);
       if (!state.cfg.enabled) { ctx.ui.notify("golden-undo: extension disabled", "warning"); return; }
       const n = parseUndoCount(args ?? "");
       if (n === 0) { ctx.ui.notify("golden-undo: nothing to undo (n=0)", "info"); return; }
@@ -827,7 +986,20 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
         ctx.ui.notify("golden-undo: a checkpoint is being committed — retry after it lands", "warning");
         return;
       }
-      const storePath = resolveStorePath(state.cfg, state.cwd);
+      if (!state.persisted) {
+        const k = Math.min(n, state.entries.length);
+        if (k === 0) { ctx.ui.notify("golden-undo: nothing to undo (store empty)", "info"); return; }
+        const removed = state.entries.slice(state.entries.length - k);
+        state.entries = state.entries.slice(0, state.entries.length - k);
+        const what = removed.map((e) => `[${e.seq}] ${e.kind}`).join(", ");
+        const restoreNote = removed.some((e) => e.kind === "checkpoint")
+          ? " — purge coverage lifted; messages still in the live branch reappear next request"
+            + " (entries pi already sealed into a compaction stay sealed)"
+          : "";
+        ctx.ui.notify(`golden-undo: Undid ${removed.length} entr${removed.length === 1 ? "y" : "ies"}: ${what}${restoreNote} (in-memory session; no disk archive)`, "info");
+        return;
+      }
+      const storePath = currentStorePath();
       if (!existsSync(storePath)) { ctx.ui.notify("golden-undo: nothing to undo (no store yet)", "info"); return; }
       const undonePath = join(dirname(storePath), "golden.undone.jsonl");
       let removed: GoldenEntry[] = [];

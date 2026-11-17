@@ -160,7 +160,7 @@ built-in defaults.
 | `minResultBytesToEject` | `2048` | auto-eject size floor (text-only results) |
 | `stripThinkingOnSpend` | `true` | strip thinking of explicitly-spent turns (DISTILL) |
 | `maxGoldenSectionBytes` | `16000` | render cap for the `<golden>` section (oldest lines drop) |
-| `scope` | `cwd` | store scoping: `cwd` (one store per launch directory), `git` (one per repo, `cwd` fallback), or `global` (single machine-wide store — the behavior before store scoping existed) |
+| `scope` | `session` | store scoping: `session` (one isolated store per pi session ID, preserved across resumes and fresh on new sessions in the same dir), `cwd` (one store per launch directory), `git` (one per repo, `cwd` fallback), or `global` (single machine-wide store) |
 | `goldenStoreRel` | `golden-context/golden.jsonl` | store path relative to the agent dir; the `scope` key is inserted as a directory segment |
 | `handleTemplate` | see config | the eject-handle text |
 
@@ -183,10 +183,10 @@ so pi's `/export` keeps recording the full vanilla transcript by construction.
 ## Where your data lives
 
 - **Golden store**: `<agentDir>/golden-context/<scope>/golden.jsonl` — append-only JSONL, scoped by
-  launch directory (`scope`, default `cwd`) so a new project starts with a fresh golden instead of
-  inheriting another project's decisions. `<scope>` uses pi's own per-directory naming
-  (`--some-repo-subdir--`), so it lines up with `sessions/--…--`; `PI_CODING_AGENT_DIR` still
-  relocates the whole thing, keeping it portable and isolatable.
+  pi session (`scope`, default `session` -> `sessions/<session-id>/golden.jsonl`) so every new
+  session starts with a fresh golden even in the same directory, while resuming a session preserves
+  its checkpoints (and `--no-session` runs stay in memory). Legacy `cwd`, `git`, and `global`
+  scopes remain selectable in `config.json`. `PI_CODING_AGENT_DIR` still relocates the whole tree.
 - **This repo ships no session data.** The replay harness needs a session JSONL of your
   own (`PI_REPLAY_FIXTURE=…`); it copies the file per test arm and never modifies the
   original.
@@ -221,9 +221,9 @@ Design rationale, reproduction recipes, and every verified assumption:
 ## Development & tests
 
 ```sh
-node test/run.mjs          # offline suite — no GPU, no model, no pi startup (165 checks)
-./test/scope-e2e.sh        # real pi, two directories, no GPU: proves per-directory golden
-                           # negative control: SCOPE_OVERRIDE=global ./test/scope-e2e.sh must FAIL
+node test/run.mjs          # offline suite — no GPU, no model, no pi startup (173 checks)
+./test/scope-e2e.sh        # real pi, same directory, no GPU: proves per-session golden
+                           # negative control: SCOPE_OVERRIDE=cwd ./test/scope-e2e.sh must FAIL
 ./test/replay.sh [arm]     # drives REAL pi over RPC against a mock backend
                            # arms: pi-only | plugin | plugin-eject | plugin-ckpt | plugin-hang
 node test/loader-probe.mjs <agentDir>   # pi's real loader accepts the extension
