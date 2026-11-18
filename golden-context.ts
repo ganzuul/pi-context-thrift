@@ -125,6 +125,10 @@ interface LiveState {
    *  the authoritative "how full is the window" input for ALL compaction triggers
    *  (findings §14: sizing from raw chat history re-fires compaction falsely) */
   kvAnchor?: KvAnchor | undefined;
+  /** monotonic generation bumped on reset/shutdown so background work stops on session swap */
+  epoch: number;
+  /** true once session_shutdown tears down this runtime */
+  disposed: boolean;
 }
 
 /**
@@ -229,13 +233,36 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     sessionId: "",
     persisted: true,
     ckptInFlight: false,
+    epoch: 0,
+    disposed: false,
   };
 
   /** Spent ids that the RENDERED golden can still justify: a spend recorded by an entry the
    *  byte cap dropped must not keep that tool result ejected (retention gate, findings §17). */
   const refresh = (): Set<string> => collectSpentIds(selectRenderedEntries(state.entries, state.cfg));
 
+  function isStaleCtxError(err: unknown): boolean {
+    return err instanceof Error && /ctx is stale|session replacement or reload/i.test(err.message);
+  }
+
+  function isCtxActive(ctx: ExtensionContext | undefined, epoch?: number): boolean {
+    if (!ctx || state.disposed) return false;
+    if (epoch !== undefined && epoch !== state.epoch) return false;
+    try {
+      // Probe getters wrapped by pi's ExtensionRunner.assertActive() before async/timer continuations.
+      void ctx.sessionManager;
+      void ctx.ui;
+      return true;
+    } catch (err) {
+      if (isStaleCtxError(err)) return false;
+      throw err;
+    }
+  }
+
   function resetTransientState(): void {
+    state.epoch += 1;
+    state.ckptInFlight = false;
+    state.ckptPromise = undefined;
     if (state.warmRetry) {
       clearTimeout(state.warmRetry);
       state.warmRetry = undefined;
@@ -444,6 +471,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", async (event, ctx) => {
+    state.disposed = false;
     state.cfg = loadConfig();
     const { cwd, sessionId, persisted } = extractCtxScope(ctx);
     const nextCwd = cwd ?? process.cwd();
@@ -462,6 +490,11 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     state.persisted = nextPersisted;
     seedForkedStoreIfNeeded(event, ctx);
     reloadActiveStore();
+  });
+
+  pi.on("session_shutdown", () => {
+    state.disposed = true;
+    resetTransientState();
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -483,6 +516,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.on("context", async (event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled) return;
     adoptScope(ctx);
+    const epoch = state.epoch;
     // IN-FLIGHT compaction — "our own solution for when context is full": if the request
     // about to go out crosses contextFullPct of the window, fold the covered history into
     // a checkpoint RIGHT HERE (mid-run), then purge below. The evidence call is bounded
@@ -495,7 +529,8 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       const projected = toLlmMessages(event.messages as never[]);
       const estTok = estimateContextSize(state.runSystemPrompt ?? "", projected, state.kvAnchor);
       if (estTok >= (ctx.model.contextWindow * state.cfg.contextFullPct) / 100) {
-        await commitCheckpoint(ctx, projected, { prefill: false, requireCompletedTurn: false, force: true });
+        await commitCheckpoint(ctx, projected, { prefill: false, requireCompletedTurn: false, force: true }, epoch);
+        if (!isCtxActive(ctx, epoch)) return;
       }
     }
     const spent = refresh();
@@ -550,7 +585,8 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
 
   /** Build the exact next-request body (system + post-purge messages + tools), or null
    *  when byte-exactness cannot be guaranteed. Also the source of the ctx counter. */
-  function buildWarmRequest(ctx: ExtensionContext): { system: string; messages: unknown[]; tools: unknown[] } | null {
+  function buildWarmRequest(ctx: ExtensionContext, epoch?: number): { system: string; messages: unknown[]; tools: unknown[] } | null {
+    if (!isCtxActive(ctx, epoch)) return null;
     const cfg = state.cfg;
     const newRender = renderGoldenSection(state.entries, cfg); // includes the fresh checkpoint
     // PRIMARY base: the bytes the engine actually received last (wire capture). Swap the
@@ -570,7 +606,7 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
         ?? replaceGoldenSection(state.runSystemPrompt ?? "", newRender);
     }
     if (!warmSystem) {
-      if (process.env.PI_GOLDEN_DEBUG) {
+      if (process.env.PI_GOLDEN_DEBUG && isCtxActive(ctx, epoch)) {
         try { (ctx as { ui?: { notify?: (m: string, t?: string) => void } }).ui?.notify?.("golden prefill: skip: next bytes unproducible", "info"); } catch { /* no UI */ }
       }
       return null; // bytes not predictable -> skip
@@ -592,15 +628,21 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   }
 
   /** Best-effort warm prefill of the post-checkpoint prefix while the user reads. */
-  async function warmPrefill(ctx: ExtensionContext, req: { system: string; messages: unknown[]; tools: unknown[] }): Promise<void> {
+  async function warmPrefill(
+    ctx: ExtensionContext,
+    req: { system: string; messages: unknown[]; tools: unknown[] },
+    epoch?: number,
+  ): Promise<void> {
+    if (!isCtxActive(ctx, epoch)) return;
     const dbg = (why: string) => {
-      if (process.env.PI_GOLDEN_DEBUG) {
+      if (process.env.PI_GOLDEN_DEBUG && isCtxActive(ctx, epoch)) {
         try { ctx.ui.notify(`golden prefill: ${why}`, "info"); } catch { /* best-effort */ }
       }
     };
     const model = ctx.model;
     if (!model) { dbg("skip: no model"); return; }
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!isCtxActive(ctx, epoch)) return;
     if (auth.ok === false) { dbg("skip: no api key"); return; }
     const stream = ctx.modelRegistry.streamSimple(model, {
       messages: [
@@ -623,26 +665,42 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
    *  The deferral exists because the settle checkpoint is fire-and-forget: by the time the
    *  evidence await lands, a scripted/automated driver may have made the session busy again
    *  (live replay proved the pre-fix version simply never fired). */
-  async function attemptWarm(ctx: ExtensionContext, req: { system: string; messages: unknown[]; tools: unknown[] }): Promise<void> {
+  async function attemptWarm(
+    ctx: ExtensionContext,
+    req: { system: string; messages: unknown[]; tools: unknown[] },
+    epoch?: number,
+  ): Promise<void> {
     if (!state.cfg.enabled || !state.cfg.prefillAfterCheckpoint) return;
+    if (!isCtxActive(ctx, epoch)) return;
     const key = warmBytesKey(req);
     if (key === state.lastWarmKey) return;
     if (ctx.isIdle()) {
       state.lastWarmKey = key;
-      await warmPrefill(ctx, req);
+      await warmPrefill(ctx, req, epoch);
       return;
     }
-    if (process.env.PI_GOLDEN_DEBUG) { try { ctx.ui.notify("golden prefill: deferred (busy), retry in 3s", "info"); } catch { /* no UI */ } }
+    if (process.env.PI_GOLDEN_DEBUG && isCtxActive(ctx, epoch)) {
+      try { ctx.ui.notify("golden prefill: deferred (busy), retry in 3s", "info"); } catch { /* no UI */ }
+    }
     if (state.warmRetry) clearTimeout(state.warmRetry);
     state.warmRetry = setTimeout(() => {
       state.warmRetry = undefined;
-      if (!state.cfg.enabled || !state.cfg.prefillAfterCheckpoint) return;
-      if (!ctx.isIdle()) {
-        if (process.env.PI_GOLDEN_DEBUG) { try { ctx.ui.notify("golden prefill: skip: still busy", "info"); } catch { /* no UI */ } }
-        return;
+      try {
+        if (!state.cfg.enabled || !state.cfg.prefillAfterCheckpoint) return;
+        if (!isCtxActive(ctx, epoch)) return;
+        if (!ctx.isIdle()) {
+          if (process.env.PI_GOLDEN_DEBUG && isCtxActive(ctx, epoch)) {
+            try { ctx.ui.notify("golden prefill: skip: still busy", "info"); } catch { /* no UI */ }
+          }
+          return;
+        }
+        state.lastWarmKey = warmBytesKey(req);
+        void warmPrefill(ctx, req, epoch).catch(() => { /* best-effort */ });
+      } catch (err) {
+        if (!isStaleCtxError(err) && process.env.PI_GOLDEN_DEBUG) {
+          try { ctx.ui.notify(`golden prefill timer error: ${err instanceof Error ? err.message : String(err)}`, "warning"); } catch { /* best-effort */ }
+        }
       }
-      state.lastWarmKey = warmBytesKey(req);
-      void warmPrefill(ctx, req).catch(() => { /* best-effort */ });
     }, 3000);
   }
 
@@ -660,11 +718,11 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
    * the settle of the compacted turn has nothing left to fold, and attemptWarm's byte-dedup
    * keeps already-warmed bytes from being re-sent.
    */
-  async function warmAtSettle(ctx: ExtensionContext): Promise<void> {
-    if (state.ckptInFlight) return;
-    const warmReq = buildWarmRequest(ctx);
+  async function warmAtSettle(ctx: ExtensionContext, epoch?: number): Promise<void> {
+    if (state.ckptInFlight || !isCtxActive(ctx, epoch)) return;
+    const warmReq = buildWarmRequest(ctx, epoch);
     if (!warmReq) return; // buildWarmRequest already traced the reason under PI_GOLDEN_DEBUG
-    await attemptWarm(ctx, warmReq);
+    await attemptWarm(ctx, warmReq, epoch);
   }
 
   /**
@@ -678,9 +736,11 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     messages: AnyMessage[],
     opts: { prefill: boolean; requireCompletedTurn: boolean; force: boolean },
+    epoch?: number,
   ): Promise<GoldenEntry | null> {
     const cfg = state.cfg;
-    if (state.ckptInFlight) return null;
+    const myEpoch = epoch ?? state.epoch;
+    if (state.ckptInFlight || !isCtxActive(ctx, myEpoch)) return null;
     try {
       if (!ctx.model) return null;
       if (messages.length === 0) return null;
@@ -703,21 +763,23 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       try {
         ctx.ui.setStatus?.("golden", "checkpointing…");
         const evidence = await callEvidenceSummary(ctx, plan);
+        if (!isCtxActive(ctx, myEpoch)) return null; // session swapped/shut down mid-call: do not mutate new session
         const text = buildCheckpointText(plan, evidence);
         if (!text.trim()) return null;
         const entry = await commitEntry("checkpoint", text, plan.toolCallIds, plan.coveredTs, plan.keepTextTs);
+        if (!isCtxActive(ctx, myEpoch)) return entry;
         // Context counter: the projected request size before/after the purge ("est"),
         // pushed to the footer the moment the checkpoint lands — pi's own counter stays
         // usage-anchored on the pre-purge request until the next response. When that
         // response arrives, message_end replaces the estimate with the MEASURED size.
-        const warmReq = buildWarmRequest(ctx);
+        const warmReq = buildWarmRequest(ctx, myEpoch);
         if (warmReq) {
           const preChars = estimateContextChars(state.runSystemPrompt ?? "", toLlmMessages(liveMessages(ctx).filter((m) => m.role !== "system")));
           const postChars = estimateContextChars(warmReq.system, warmReq.messages as never[]);
           state.lastCkptStatus = `ckpt [${entry.seq}] · est ${formatTokens(Math.round(preChars / 4))}→${formatTokens(Math.round(postChars / 4))} tok`;
           state.lastCkptMeasured = false;
           ctx.ui.setStatus?.("golden", state.lastCkptStatus);
-          if (opts.prefill) await attemptWarm(ctx, warmReq);
+          if (opts.prefill) await attemptWarm(ctx, warmReq, myEpoch);
         } else {
           state.lastCkptStatus = `ckpt [${entry.seq}] committed`;
           state.lastCkptMeasured = false;
@@ -725,30 +787,42 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
         }
         return entry;
       } finally {
-        state.ckptInFlight = false;
-        ctx.ui.setStatus?.("golden", undefined);
+        if (myEpoch === state.epoch) state.ckptInFlight = false;
+        if (isCtxActive(ctx, myEpoch)) {
+          try { ctx.ui.setStatus?.("golden", undefined); } catch { /* stale ctx */ }
+        }
       }
     } catch (err) {
+      if (isStaleCtxError(err) || !isCtxActive(ctx, myEpoch)) return null;
       const message = err instanceof Error ? err.message : String(err);
       try { ctx.ui.notify(`golden checkpoint skipped: ${message}`, "warning"); } catch { /* best-effort */ }
       return null;
     }
   }
 
-  async function runCheckpoint(ctx: ExtensionContext): Promise<void> {
-    if (!ctx.isIdle()) return; // pi is compacting/streaming — never start interleaved
+  async function runCheckpoint(ctx: ExtensionContext, epoch: number): Promise<void> {
+    if (!isCtxActive(ctx, epoch) || !ctx.isIdle()) return; // pi is compacting/streaming or session closed
     const messages = toLlmMessages(liveMessages(ctx));
-    const entry = await commitCheckpoint(ctx, messages, { prefill: true, requireCompletedTurn: true, force: false });
+    const entry = await commitCheckpoint(ctx, messages, { prefill: true, requireCompletedTurn: true, force: false }, epoch);
+    if (!isCtxActive(ctx, epoch)) return;
     // widened policy: a settle that folded NOTHING still warms (attemptWarm dedups identical
     // bytes, so the folded case above — which already warmed — is not re-warmed here)
-    if (!entry) await warmAtSettle(ctx);
+    if (!entry) await warmAtSettle(ctx, epoch);
   }
 
   pi.on("agent_settled", (_event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled || !state.cfg.autoCheckpoint) return;
     adoptScope(ctx);
     if (state.ckptInFlight) return;
-    state.ckptPromise = runCheckpoint(ctx).finally(() => { state.ckptPromise = undefined; }); // fire-and-forget on purpose (see note above)
+    const epoch = state.epoch;
+    const p = runCheckpoint(ctx, epoch)
+      .catch((err) => {
+        if (isStaleCtxError(err) || !isCtxActive(ctx, epoch)) return;
+        const message = err instanceof Error ? err.message : String(err);
+        try { ctx.ui.notify(`golden checkpoint skipped: ${message}`, "warning"); } catch { /* best-effort */ }
+      })
+      .finally(() => { if (state.ckptPromise === p) state.ckptPromise = undefined; }); // fire-and-forget on purpose (see note above)
+    state.ckptPromise = p;
   });
 
   /**
@@ -763,10 +837,12 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
   pi.on("session_before_compact", async (event, ctx: ExtensionContext) => {
     if (!state.cfg.enabled || !state.cfg.takeoverCompaction) return; // pi's compaction runs as-is
     adoptScope(ctx);
+    const epoch = state.epoch;
     const inflight = state.ckptPromise;
     if (inflight) {
       await Promise.race([inflight, new Promise((r) => setTimeout(r, 10_000))]);
     }
+    if (!isCtxActive(ctx, epoch)) return { cancel: true };
     const branchEntries = (event as { branchEntries?: SessionEntry[] }).branchEntries ?? ctx.sessionManager.getBranch();
     const messages = toLlmMessages(buildSessionContext(branchEntries as never).messages as unknown as AnyMessage[]);
 
@@ -788,8 +864,8 @@ export default function goldenContextExtension(pi: ExtensionAPI): void {
       }
     }
 
-    const entry = await commitCheckpoint(ctx, messages, { prefill: false, requireCompletedTurn: false, force: true });
-    if (!entry) return { cancel: true };
+    const entry = await commitCheckpoint(ctx, messages, { prefill: false, requireCompletedTurn: false, force: true }, epoch);
+    if (!entry || !isCtxActive(ctx, epoch)) return { cancel: true };
 
     // pi keeps entries from firstKeptEntryId onward verbatim -> the live reply entry.
     let firstKeptEntryId: string | undefined;

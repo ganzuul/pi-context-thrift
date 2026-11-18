@@ -221,7 +221,7 @@ Design rationale, reproduction recipes, and every verified assumption:
 ## Development & tests
 
 ```sh
-node test/run.mjs          # offline suite — no GPU, no model, no pi startup (173 checks)
+node test/run.mjs          # offline suite — no GPU, no model, no pi startup (180 checks)
 ./test/scope-e2e.sh        # real pi, same directory, no GPU: proves per-session golden
                            # negative control: SCOPE_OVERRIDE=cwd ./test/scope-e2e.sh must FAIL
 ./test/replay.sh [arm]     # drives REAL pi over RPC against a mock backend

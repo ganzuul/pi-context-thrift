@@ -953,6 +953,265 @@ check("adapter wired session_start/before_agent_start/context", !!handlers.sessi
       statusLines.some((x) => /render:.*1\/2.*dropped.*retention gate/.test(x)));
   }
 
+  // ---- stale-ctx safety across session switches (/resume, newSession, reload) ----
+  {
+    const fs = require("node:fs");
+    fs.writeFileSync(join(AGENT, "golden-context", "config.json"), JSON.stringify({ tailKeepToolResults: 0 }));
+
+    const unhandled = [];
+    const onRejection = (err) => unhandled.push(err);
+    const onUncaught = (err) => unhandled.push(err);
+    process.on("unhandledRejection", onRejection);
+    process.on("uncaughtException", onUncaught);
+
+    const staleError = () => new Error(
+      "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+    );
+    const makeStaleAwareCtx = (base, isStale) => ({
+      get cwd() { if (isStale()) throw staleError(); return base.cwd; },
+      get ui() { if (isStale()) throw staleError(); return base.ui; },
+      get model() { if (isStale()) throw staleError(); return base.model; },
+      get modelRegistry() { if (isStale()) throw staleError(); return base.modelRegistry; },
+      get sessionManager() { if (isStale()) throw staleError(); return base.sessionManager; },
+      get thinkingLevel() { if (isStale()) throw staleError(); return base.thinkingLevel; },
+      isIdle() { if (isStale()) throw staleError(); return base.isIdle(); },
+      getContextUsage() { if (isStale()) throw staleError(); return base.getContextUsage ? base.getContextUsage() : undefined; },
+      getSystemPrompt() { if (isStale()) throw staleError(); return base.getSystemPrompt ? base.getSystemPrompt() : "BASE"; },
+    });
+
+    try {
+      // 1) In-flight evidence call when session switches (/resume -> session B):
+      //    no unhandled rejection, no pollution into B's store, and ckptInFlight resets so B still checkpoints.
+      const STALE_SESS_A = "01a10000-0000-7000-8000-000000000005";
+      const STALE_SESS_B = "01a10000-0000-7000-8000-000000000006";
+      const STORE_B = join(AGENT, "golden-context", "sessions", STALE_SESS_B, "golden.jsonl");
+      const smA = fixtureSm({
+        getSessionId: () => STALE_SESS_A,
+        getSessionFile: () => join(AGENT, "sessions", "sa.jsonl"),
+        getBranch: () => [
+          { type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "bash", description: "d", parameters: {} }], timestamp: 1 } },
+          { type: "message", message: { role: "user", content: [{ type: "text", text: "session A prompt" }], timestamp: 100 } },
+          { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "tSTALE_A", name: "bash", arguments: { command: "echo A" } }], timestamp: 101 } },
+          { type: "message", message: { role: "toolResult", toolCallId: "tSTALE_A", toolName: "bash", isError: false, timestamp: 102, content: [{ type: "text", text: "A_OUT" }] } },
+          { type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "A done" }], timestamp: 103 } },
+        ],
+      });
+      await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: smA });
+      handlers.before_agent_start[0]({ systemPromptOptions: { sections: {} }, get systemPrompt() { return "BASE-A"; } });
+
+      let staleA = false;
+      let resolveEvidenceA;
+      const callsA = [];
+      const ctxA = makeStaleAwareCtx({
+        cwd: FIXTURE_CWD,
+        ui: { setStatus() {}, notify() {}, setWidget() {} },
+        model: { id: "tinyclip", provider: "mock" },
+        thinkingLevel: "low",
+        isIdle: () => true,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
+          streamSimple: (_m, _c, opts) => {
+            callsA.push(opts);
+            return { result: () => new Promise((r) => { resolveEvidenceA = () => r({ content: [{ type: "text", text: "STALE-A-SHOULD-NOT-COMMIT-TO-B" }] }); }) };
+          },
+        },
+        sessionManager: smA,
+      }, () => staleA);
+
+      handlers.agent_settled[0]({}, ctxA);
+      await new Promise((r) => setTimeout(r, 30)); // wait until A's evidence request is in flight
+
+      // Switch session synchronously like pi's /resume -> teardownCurrent() + switchSession()
+      if (handlers.session_shutdown?.[0]) await handlers.session_shutdown[0]({}, ctxA);
+      staleA = true;
+
+      const smB = fixtureSm({
+        getSessionId: () => STALE_SESS_B,
+        getSessionFile: () => join(AGENT, "sessions", "sb.jsonl"),
+        getBranch: () => [
+          { type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "bash", description: "d", parameters: {} }], timestamp: 1 } },
+          { type: "message", message: { role: "user", content: [{ type: "text", text: "session B prompt" }], timestamp: 200 } },
+          { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "tSTALE_B", name: "bash", arguments: { command: "echo B" } }], timestamp: 201 } },
+          { type: "message", message: { role: "toolResult", toolCallId: "tSTALE_B", toolName: "bash", isError: false, timestamp: 202, content: [{ type: "text", text: "B_OUT" }] } },
+          { type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "B done" }], timestamp: 203 } },
+        ],
+      });
+      await handlers.session_start[0]({ reason: "resume" }, { cwd: FIXTURE_CWD, sessionManager: smB });
+      handlers.before_agent_start[0]({ systemPromptOptions: { sections: {} }, get systemPrompt() { return "BASE-B"; } });
+
+      // Now Session A's old evidence promise resolves while Session B is live
+      resolveEvidenceA();
+      await new Promise((r) => setTimeout(r, 50));
+      check("stale session A evidence resolution throws zero unhandled rejections", unhandled.length === 0);
+      check("stale session A never commits into session B's store", !fs.existsSync(STORE_B));
+
+      // Verify Session B is not stuck on stale ckptInFlight
+      const ctxB = {
+        cwd: FIXTURE_CWD,
+        ui: { setStatus() {}, notify() {}, setWidget() {} },
+        model: { id: "tinyclip", provider: "mock" },
+        thinkingLevel: "low",
+        isIdle: () => true,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
+          streamSimple: () => ({ result: async () => ({ content: [{ type: "text", text: "FRESH-B-EVIDENCE" }] }) }),
+        },
+        sessionManager: smB,
+      };
+      handlers.agent_settled[0]({}, ctxB);
+      let bLines = [];
+      for (let i = 0; i < 40 && bLines.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        try { bLines = fs.readFileSync(STORE_B, "utf8").trim().split("\n").map((l) => JSON.parse(l)); } catch { /* wait */ }
+      }
+      await new Promise((r) => setTimeout(r, 40));
+      check("session B still commits normally after session A aborted mid-checkpoint",
+        bLines.some((l) => /FRESH-B-EVIDENCE/.test(l.text)) && !bLines.some((l) => /STALE-A/.test(l.text)));
+
+      // 2) Pure-text / no-fold settle where ctx goes stale right before warmAtSettle -> buildWarmRequest -> liveMessages
+      //    (reproduces exact crash stack without requiring session_shutdown to have fired first).
+      const STALE_PURE_SESS = "01a10000-0000-7000-8000-000000000007";
+      const PURE_STORE = join(AGENT, "golden-context", "sessions", STALE_PURE_SESS, "golden.jsonl");
+      fs.mkdirSync(dirname(PURE_STORE), { recursive: true });
+      const seedEntry = { seq: 0, ts: 1, kind: "record", text: "prior seed note", spend: [] };
+      fs.writeFileSync(PURE_STORE, core.entryToJsonLine(seedEntry) + "\n");
+      const seedRender = core.renderGoldenSection([seedEntry], core.parseConfig({}));
+      let branchGets = 0;
+      let pureStale = false;
+      const smPureBase = fixtureSm({
+        getSessionId: () => STALE_PURE_SESS,
+        getSessionFile: () => join(AGENT, "sessions", "spure.jsonl"),
+        getBranch: () => {
+          branchGets++;
+          // First getBranch (commitCheckpoint) succeeds; second (warmAtSettle -> buildWarmRequest -> liveMessages) hits stale ctx
+          if (branchGets >= 2) { pureStale = true; throw staleError(); }
+          return [
+            { type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "bash", description: "d", parameters: {} }], timestamp: 1 } },
+            { type: "message", message: { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 500 } },
+            { type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "hello" }], timestamp: 501 } },
+          ];
+        },
+      });
+      await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: smPureBase });
+      handlers.before_agent_start[0]({ systemPromptOptions: { sections: {} }, get systemPrompt() { return `BASE-PURE\n\n<golden>\n${seedRender}\n</golden>`; } });
+      const pureStreamCalls = [];
+      const ctxPure = makeStaleAwareCtx({
+        cwd: FIXTURE_CWD,
+        ui: { setStatus() {}, notify() {}, setWidget() {} },
+        model: { id: "tinyclip", provider: "mock" },
+        thinkingLevel: "low",
+        isIdle: () => true,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
+          streamSimple: (_m, _c, opts) => { pureStreamCalls.push(opts); return { result: async () => ({ content: [{ type: "text", text: "ok" }] }) }; },
+        },
+        sessionManager: smPureBase,
+      }, () => pureStale);
+
+      // Variant A: stale immediately on microtask yield after agent_settled (no session_shutdown fired)
+      pureStale = false;
+      handlers.agent_settled[0]({}, ctxPure);
+      pureStale = true;
+      await new Promise((r) => setTimeout(r, 40));
+
+      // Variant B: active at commitCheckpoint, goes stale inside buildWarmRequest -> liveMessages
+      pureStale = false;
+      branchGets = 0;
+      handlers.agent_settled[0]({}, ctxPure);
+      await new Promise((r) => setTimeout(r, 40));
+      check("pure-text warmAtSettle -> buildWarmRequest -> liveMessages stale ctx causes zero unhandled rejections",
+        unhandled.length === 0 && pureStale === true && pureStreamCalls.length === 0);
+
+      // 3) Deferred warmRetry timer: cleared on session_shutdown AND guarded against stale ctx
+      const realSetTimeout = globalThis.setTimeout;
+      const realClearTimeout = globalThis.clearTimeout;
+      let capturedTimer = null;
+      const clearedIds = [];
+      let fakeId = 990000;
+      try {
+        globalThis.setTimeout = (fn, ms, ...args) => {
+          if (ms === 3000) {
+            const id = ++fakeId;
+            capturedTimer = { id, fn: () => fn(...args) };
+            return id;
+          }
+          return realSetTimeout(fn, ms, ...args);
+        };
+        globalThis.clearTimeout = (id) => {
+          clearedIds.push(id);
+          if (typeof id === "number" && id >= 990000) return;
+          return realClearTimeout(id);
+        };
+
+        // Helper: run an idle settle whose session turns busy during the evidence call, scheduling warmRetry (3000ms)
+        const triggerDeferredWarmRetry = async (sessId, label, branchBaseTs) => {
+          let busyStale = false;
+          let busyIdle = true;
+          let warmCalls = 0;
+          const smBusy = fixtureSm({
+            getSessionId: () => sessId,
+            getSessionFile: () => join(AGENT, "sessions", `${label}.jsonl`),
+            getBranch: () => [
+              { type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "bash", description: "d", parameters: {} }], timestamp: 1 } },
+              { type: "message", message: { role: "user", content: [{ type: "text", text: `hi ${label}` }], timestamp: branchBaseTs } },
+              { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: `t_${label}`, name: "bash", arguments: { command: "echo ok" } }], timestamp: branchBaseTs + 1 } },
+              { type: "message", message: { role: "toolResult", toolCallId: `t_${label}`, toolName: "bash", isError: false, timestamp: branchBaseTs + 2, content: [{ type: "text", text: "ok" }] } },
+              { type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `done ${label}` }], timestamp: branchBaseTs + 3 } },
+            ],
+          });
+          await handlers.session_start[0]({ reason: "startup" }, { cwd: FIXTURE_CWD, sessionManager: smBusy });
+          handlers.before_agent_start[0]({ systemPromptOptions: { sections: {} }, get systemPrompt() { return `BASE-${label}`; } });
+          const ctxBusy = makeStaleAwareCtx({
+            cwd: FIXTURE_CWD,
+            ui: { setStatus() {}, notify() {}, setWidget() {} },
+            model: { id: "tinyclip", provider: "mock" },
+            thinkingLevel: "low",
+            isIdle: () => busyIdle,
+            modelRegistry: {
+              getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
+              streamSimple: (_m, _c, opts) => {
+                if (opts?.maxTokens === 1) warmCalls++;
+                else busyIdle = false; // session becomes busy before warmPrefill runs
+                return { result: async () => ({ content: [{ type: "text", text: `evidence ${label}` }] }) };
+              },
+            },
+            sessionManager: smBusy,
+          }, () => busyStale);
+
+          capturedTimer = null;
+          handlers.agent_settled[0]({}, ctxBusy);
+          for (let i = 0; i < 30 && capturedTimer === null; i++) {
+            await new Promise((r) => realSetTimeout(r, 15));
+          }
+          return { ctxBusy, setStale: () => { busyStale = true; }, getWarmCalls: () => warmCalls };
+        };
+
+        // A) session_shutdown cancels the pending warmRetry timer
+        const runA = await triggerDeferredWarmRetry("01a10000-0000-7000-8000-000000000008", "busyA", 600);
+        check("busy settle schedules deferred warmRetry timer", capturedTimer !== null);
+        const shutdownHandler = handlers.session_shutdown?.[0];
+        if (shutdownHandler) await shutdownHandler({}, runA.ctxBusy);
+        check("session_shutdown clears pending warmRetry timer",
+          capturedTimer !== null && clearedIds.includes(capturedTimer.id));
+
+        // B) Even if the timer callback runs against a stale ctx without session_shutdown, it is a safe no-op
+        const runB = await triggerDeferredWarmRetry("01a10000-0000-7000-8000-000000000009", "busyB", 700);
+        runB.setStale();
+        let timerThrew = false;
+        try { capturedTimer?.fn(); } catch { timerThrew = true; }
+        await new Promise((r) => realSetTimeout(r, 20));
+        check("warmRetry callback safely ignores stale ctx without throwing or warming",
+          capturedTimer !== null && !timerThrew && runB.getWarmCalls() === 0 && unhandled.length === 0);
+      } finally {
+        globalThis.setTimeout = realSetTimeout;
+        globalThis.clearTimeout = realClearTimeout;
+      }
+    } finally {
+      process.off("unhandledRejection", onRejection);
+      process.off("uncaughtException", onUncaught);
+    }
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
